@@ -2,11 +2,12 @@
   "listen": "0.0.0.0",
   "port": 9443,
   "tls": {
+    "enabled": true,
     "cert_file": "/etc/nass3cp/server.crt",
     "key_file": "/etc/nass3cp/server.key"
   },
   "auth": {
-    "token": "${NASS3CP_TOKEN}"
+    "password": "${NASS3CP_PASSWORD}"
   },
   "allowed_roots": [
     "/volume1/share"

@@ -186,9 +186,9 @@ class ServerApp:
     def authenticated(self, authorization: Optional[str]) -> bool:
         if not authorization or not authorization.startswith("Bearer "):
             return False
-        token = authorization[len("Bearer ") :]
-        actual = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return hmac.compare_digest(actual, self.config.auth_token_sha256)
+        password = authorization[len("Bearer ") :]
+        actual = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return hmac.compare_digest(actual, self.config.auth_password_sha256)
 
     def resolve_remote(self, requested: str, write: bool, overwrite: bool = False) -> Path:
         if not requested or "\x00" in requested:
@@ -599,7 +599,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             return True
         self._send_json(
             HTTPStatus.UNAUTHORIZED,
-            {"error": {"code": "unauthorized", "message": "valid bearer token required"}},
+            {"error": {"code": "unauthorized", "message": "valid password required"}},
         )
         return False
 
@@ -729,14 +729,16 @@ def check_s3(config: ServerConfig) -> None:
         raise S3Error("S3 relay check could not delete its object: %s" % cleanup_errors[0])
 
 
-def validate_server_config(config: ServerConfig) -> ssl.SSLContext:
-    if not config.cert_file.is_file():
-        raise ConfigError("TLS certificate does not exist: %s" % config.cert_file)
-    if not config.key_file.is_file():
-        raise ConfigError("TLS private key does not exist: %s" % config.key_file)
+def validate_server_config(config: ServerConfig) -> Optional[ssl.SSLContext]:
     for root in config.allowed_roots:
         if not root.is_dir():
             raise ConfigError("allowed root is not a directory: %s" % root)
+    if not config.tls_enabled:
+        return None
+    if config.cert_file is None or not config.cert_file.is_file():
+        raise ConfigError("TLS certificate does not exist: %s" % config.cert_file)
+    if config.key_file is None or not config.key_file.is_file():
+        raise ConfigError("TLS private key does not exist: %s" % config.key_file)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(str(config.cert_file), str(config.key_file))
@@ -747,11 +749,19 @@ def run(config: ServerConfig) -> None:
     context = validate_server_config(config)
     app = ServerApp(config)
     server = Nass3cpHTTPServer((config.listen, config.port), RequestHandler, app)
-    server.socket = context.wrap_socket(server.socket, server_side=True)
+    if context is not None:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     janitor = threading.Thread(target=app.janitor, daemon=True)
     janitor.start()
     app.start_worker(app.cleanup_interrupted)
-    LOG.info("listening with TLS on %s:%d", config.listen, config.port)
+    if context is None:
+        LOG.warning(
+            "listening without application TLS on %s:%d; the overlay/tunnel must be encrypted",
+            config.listen,
+            config.port,
+        )
+    else:
+        LOG.info("listening with TLS on %s:%d", config.listen, config.port)
     previous_sigterm = None
     if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
         previous_sigterm = signal.getsignal(signal.SIGTERM)

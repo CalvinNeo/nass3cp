@@ -56,10 +56,11 @@ nass3cp/
 │   └── nass3cp-server
 ├── config/
 │   ├── server.json
+│   ├── server.overlay.json # 无应用层 TLS 的覆盖网络模板
 │   ├── server.env          # 从示例复制，不提交 Git
-│   ├── server.crt
-│   ├── server.key
-│   └── client.env          # 仅客户端需要
+│   ├── server.crt          # 仅 TLS 模式需要
+│   ├── server.key          # 仅 TLS 模式需要
+│   └── client.env          # 可选；默认交互输入密码
 ├── src/
 ├── state/                  # 首次运行自动创建
 └── run/                    # 使用 nohup 时存放日志和 PID
@@ -74,14 +75,16 @@ chmod 700 bin/nass3cp bin/nass3cp-server
 chmod 600 config/server.env
 ```
 
-把 NAS API 使用的 TLS 证书和私钥分别放到 `config/server.crt`、`config/server.key`，然后执行 `chmod 600 config/server.key`。
+选择一种控制通道配置并修改：
 
-直接修改项目内的 [`config/server.json`](../config/server.json)：
+- [`config/server.overlay.json`](../config/server.overlay.json)：用于已经加密的 ZeroTier/OpenTier 或 FRP 隧道，不需要 CRT。用于覆盖网络时把 `listen` 从 `127.0.0.1` 改成 NAS 的虚拟 IP；同机 FRP 可以保持 `127.0.0.1`。
+- [`config/server.json`](../config/server.json)：程序自身使用 TLS。把证书和私钥放到 `config/server.crt`、`config/server.key`，然后执行 `chmod 600 config/server.key`。
+
+修改所选配置中的以下字段：
 
 - `s3.endpoint`：替换成 `https://ACCOUNT_ID.r2.cloudflarestorage.com`
 - `s3.bucket`：替换成第 2 步创建的 Bucket 名
 - `allowed_roots`：改成 NAS 上允许访问的真实目录
-- `tls.cert_file`、`tls.key_file`：默认指向同一 `config/` 目录内的 `server.crt` 和 `server.key`
 - `state_dir`：默认是 `../state`，按配置文件所在目录解析，即项目根目录的 `state/`
 
 以下 R2 参数应保持不变：
@@ -100,32 +103,31 @@ chmod 600 config/server.env
 编辑 [`config/server.env.example`](../config/server.env.example) 的副本 `config/server.env`，不要把实际秘密写进 JSON：
 
 ```text
-NASS3CP_TOKEN=替换为随机控制通道令牌
+NASS3CP_PASSWORD=替换为高强度随机密码
 CLOUDFLARE_R2_ACCESS_KEY_ID=替换为Access-Key-ID
 CLOUDFLARE_R2_SECRET_ACCESS_KEY=替换为Secret-Access-Key
 ```
 
-可以使用 Python 标准库生成控制通道令牌：
+可以使用 Python 标准库生成密码：
 
 ```bash
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-`bin/nass3cp-server` 会自动读取项目内的 `config/server.env` 和 `config/server.json`。环境文件按 `KEY=VALUE` 解析，不作为 shell 脚本执行，不支持变量展开或命令替换；进程外部已经设置的环境变量优先。
+`bin/nass3cp-server` 会自动读取项目内的 `config/server.env`；未指定 `--config` 时使用 `config/server.json`。环境文件按 `KEY=VALUE` 解析，不作为 shell 脚本执行，不支持变量展开或命令替换；进程外部已经设置的环境变量优先。
+
+也可以把密码直接写成 `"auth": {"password": "..."}`，但项目内的 `server.env` 更不容易被误提交。旧版的 `auth.token`/`NASS3CP_TOKEN` 仍然兼容。
 
 ## 6. 上线前验证
 
-在项目根目录验证本地 TLS、目录和配置：
+覆盖网络模式在项目根目录这样验证配置和 R2：
 
 ```bash
-./bin/nass3cp-server --check-config
+./bin/nass3cp-server --config config/server.overlay.json --check-config
+./bin/nass3cp-server --config config/server.overlay.json --check-s3
 ```
 
-再验证 R2 的 PUT、GET 和 DELETE。该命令只写入几十字节，读回校验后立即删除：
-
-```bash
-./bin/nass3cp-server --check-s3
-```
+`--check-s3` 只写入几十字节，读回校验后立即删除。TLS 模式去掉上面的 `--config config/server.overlay.json` 即可。
 
 成功输出：
 
@@ -136,14 +138,14 @@ S3 relay check passed (PUT, GET, DELETE)
 前台启动服务：
 
 ```bash
-./bin/nass3cp-server
+./bin/nass3cp-server --config config/server.overlay.json
 ```
 
 需要退出 SSH 后继续运行时，可以使用 Linux 自带的 `nohup`，仍然不依赖 systemd：
 
 ```bash
 mkdir -p run
-nohup ./bin/nass3cp-server >run/nass3cp.log 2>&1 &
+nohup ./bin/nass3cp-server --config config/server.overlay.json >run/nass3cp.log 2>&1 &
 echo $! >run/nass3cp.pid
 ```
 
@@ -160,21 +162,21 @@ tail -f run/nass3cp.log
 kill "$(cat run/nass3cp.pid)"
 ```
 
-客户端机器也可以直接保留一份项目目录，不需要安装。复制 Token 文件并测试小文件：
+客户端机器也可以直接保留一份项目目录，不需要安装。覆盖网络模式测试小文件时加 `--no-tls`，程序会在终端提示密码且输入不会回显：
 
 ```bash
-cp config/client.env.example config/client.env
-chmod 600 config/client.env
-
-# 编辑 config/client.env，将占位值换成与服务端相同的 NASS3CP_TOKEN
-
-./bin/nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
+./bin/nass3cp --no-tls --host 10.10.10.2 --port 9443 \
   ./small-test.bin nas:/volume1/share/small-test.bin
+NAS password:
 ```
+
+将 `10.10.10.2` 换成 NAS 的覆盖网络 IP。无人值守场景可使用 `--password-file`，或复制 `config/client.env.example` 为 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
 
 ## 安全和费用说明
 
-- NAS 控制通道和 R2 数据通道都使用 HTTPS/TLS；程序拒绝 HTTP Endpoint 和 HTTP 预签名 URL。
+- R2 数据通道始终使用 HTTPS；程序拒绝 HTTP Endpoint 和 HTTP 预签名 URL。
+- 无应用层 TLS 时，NAS 控制通道是 HTTP，密码也在这条通道内传输。只有在底层覆盖网络或隧道已经提供加密和身份认证时才可使用；内网地址本身不是安全边界。
+- 无 TLS 服务端不能监听 `0.0.0.0` 或 `::`，必须绑定覆盖网络 IP，或绑定 `127.0.0.1` 供同机 FRP 使用。
 - R2 自动进行 AES-256 静态加密，但 Cloudflare 在服务端解密时仍能看到文件明文。若要求云厂商不能读取内容，需要另加客户端侧 AEAD 加密。
 - 预签名 URL 是短时 Bearer 凭证，应像临时密码一样处理；默认 15 分钟过期。
 - 在上述免费额度内，偶尔传输 1 GiB 的 R2 费用通常为 $0。重试不会产生 R2 公网下行费，但仍会计入操作次数。

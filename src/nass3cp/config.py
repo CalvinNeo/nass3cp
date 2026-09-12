@@ -130,9 +130,10 @@ class S3Config:
 class ServerConfig:
     listen: str
     port: int
-    cert_file: Path
-    key_file: Path
-    auth_token_sha256: str
+    tls_enabled: bool
+    cert_file: Optional[Path]
+    key_file: Optional[Path]
+    auth_password_sha256: str
     allowed_roots: List[Path]
     state_dir: Path
     chunk_size: int
@@ -246,16 +247,40 @@ def load_server_config(filename: str) -> ServerConfig:
     if not roots_raw or not all(isinstance(item, str) and item for item in roots_raw):
         raise ConfigError("allowed_roots must be a non-empty array of paths")
 
-    token_hash = auth.get("token_sha256")
-    token = auth.get("token")
-    if token_hash is not None:
-        if not isinstance(token_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", token_hash):
-            raise ConfigError("auth.token_sha256 must be a 64-character hex SHA-256 digest")
-        token_hash = token_hash.lower()
-    elif isinstance(token, str) and token:
-        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    auth_options = (
+        "password_sha256",
+        "password",
+        "token_sha256",  # Backward-compatible names used by version 0.1.
+        "token",
+    )
+    configured_auth = [name for name in auth_options if auth.get(name) is not None]
+    if len(configured_auth) != 1:
+        raise ConfigError("set exactly one auth.password or auth.password_sha256")
+    auth_name = configured_auth[0]
+    auth_value = auth[auth_name]
+    if auth_name.endswith("_sha256"):
+        if not isinstance(auth_value, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{64}", auth_value
+        ):
+            raise ConfigError(
+                "auth.%s must be a 64-character hex SHA-256 digest" % auth_name
+            )
+        password_hash = auth_value.lower()
+    elif isinstance(auth_value, str) and auth_value:
+        if any(character in auth_value for character in ("\r", "\n", "\x00")):
+            raise ConfigError("auth.%s must be a single line" % auth_name)
+        password_hash = hashlib.sha256(auth_value.encode("utf-8")).hexdigest()
     else:
-        raise ConfigError("set auth.token_sha256 or auth.token")
+        raise ConfigError("auth.%s must be a non-empty string" % auth_name)
+
+    tls_enabled = tls.get("enabled", True)
+    if not isinstance(tls_enabled, bool):
+        raise ConfigError("tls.enabled must be a boolean")
+    cert_file: Optional[Path] = None
+    key_file: Optional[Path] = None
+    if tls_enabled:
+        cert_file = _path_from_config(_require(tls, "cert_file", str), base)
+        key_file = _path_from_config(_require(tls, "key_file", str), base)
 
     port = _positive_int(raw, "port", 9443)
     if port > 65535:
@@ -268,15 +293,20 @@ def load_server_config(filename: str) -> ServerConfig:
     state_dir = raw.get("state_dir", "./state")
     if not isinstance(listen, str) or not listen:
         raise ConfigError("listen must be a non-empty string")
+    if not tls_enabled and listen.strip("[]") in ("0.0.0.0", "::"):
+        raise ConfigError(
+            "TLS-disabled mode must bind an overlay IP or loopback address, not a wildcard"
+        )
     if not isinstance(state_dir, str) or not state_dir:
         raise ConfigError("state_dir must be a non-empty path string")
 
     return ServerConfig(
         listen=listen,
         port=port,
-        cert_file=_path_from_config(_require(tls, "cert_file", str), base),
-        key_file=_path_from_config(_require(tls, "key_file", str), base),
-        auth_token_sha256=token_hash,
+        tls_enabled=tls_enabled,
+        cert_file=cert_file,
+        key_file=key_file,
+        auth_password_sha256=password_hash,
         allowed_roots=[_path_from_config(item, base) for item in roots_raw],
         state_dir=_path_from_config(state_dir, base),
         chunk_size=chunk_size,

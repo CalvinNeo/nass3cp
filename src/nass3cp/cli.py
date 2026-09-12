@@ -1,4 +1,5 @@
 import argparse
+import getpass
 import os
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ def _remote(value: str) -> Optional[str]:
     return None
 
 
-def _base_url(host: str, port: int) -> str:
+def _base_url(host: str, port: int, tls: bool = True) -> str:
     if (
         not host
         or "://" in host
@@ -29,23 +30,31 @@ def _base_url(host: str, port: int) -> str:
         raise Nass3cpError("--host must be a hostname or IP address, not a URL")
     if ":" in host and not (host.startswith("[") and host.endswith("]")):
         host = "[" + host + "]"
-    return "https://%s:%d" % (host, port)
+    return "%s://%s:%d" % ("https" if tls else "http", host, port)
 
 
-def _token(args: argparse.Namespace) -> str:
+def _password(args: argparse.Namespace) -> str:
+    password_file = args.password_file or args.token_file
     if args.token is not None:
         value = args.token
-    elif args.token_file is not None:
+    elif password_file is not None:
         try:
-            value = Path(args.token_file).read_text(encoding="utf-8").strip()
+            value = Path(password_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
-            raise Nass3cpError("cannot read token file: %s" % exc) from exc
+            raise Nass3cpError("cannot read password file: %s" % exc) from exc
     else:
-        value = os.environ.get("NASS3CP_TOKEN", "")
+        value = os.environ.get("NASS3CP_PASSWORD") or os.environ.get("NASS3CP_TOKEN", "")
+        if not value:
+            try:
+                value = getpass.getpass("NAS password: ")
+            except EOFError as exc:
+                raise Nass3cpError(
+                    "cannot read a password; use an interactive terminal or --password-file"
+                ) from exc
     if not value:
-        raise Nass3cpError("set NASS3CP_TOKEN or use --token-file")
+        raise Nass3cpError("password must not be empty")
     if "\r" in value or "\n" in value:
-        raise Nass3cpError("token must be a single line")
+        raise Nass3cpError("password must be a single line")
     return value
 
 
@@ -55,16 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Copy one file between this computer and a NAS through S3",
     )
     parser.add_argument("--host", required=True, help="NAS service hostname or IP")
-    parser.add_argument("--port", type=int, default=9443, help="NAS service TLS port (default: 9443)")
+    parser.add_argument("--port", type=int, default=9443, help="NAS service port (default: 9443)")
     auth = parser.add_mutually_exclusive_group()
     auth.add_argument("--token", help=argparse.SUPPRESS)
-    auth.add_argument("--token-file", help="read the bearer token from this file")
+    auth.add_argument("--token-file", help=argparse.SUPPRESS)
+    auth.add_argument("--password-file", help="read the NAS password from this file instead of prompting")
     tls = parser.add_mutually_exclusive_group()
     tls.add_argument("--ca-file", help="CA certificate used to verify the NAS service")
     tls.add_argument(
         "--insecure",
         action="store_true",
         help="encrypt but do not authenticate the NAS TLS certificate (unsafe)",
+    )
+    tls.add_argument(
+        "--no-tls",
+        action="store_true",
+        help="use HTTP over an already-encrypted overlay network or tunnel",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing destination file")
     parser.add_argument("--jobs", type=int, default=2, help="parallel S3 requests (default: 2)")
@@ -104,9 +119,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         source_remote, destination_remote = _validate_args(args)
         if args.insecure:
             print("warning: --insecure permits a man-in-the-middle attack", file=sys.stderr)
+        if args.no_tls:
+            print(
+                "warning: NAS control traffic relies on the overlay/tunnel for encryption",
+                file=sys.stderr,
+            )
         api = ApiClient(
-            _base_url(args.host, args.port),
-            _token(args),
+            _base_url(args.host, args.port, tls=not args.no_tls),
+            _password(args),
             ca_file=args.ca_file,
             insecure=args.insecure,
         )

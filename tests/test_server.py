@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from nass3cp.config import S3Config, ServerConfig
+from nass3cp.client import ApiClient
 from nass3cp.server import (
     ApiError,
     Nass3cpHTTPServer,
@@ -58,9 +59,10 @@ class ServerTransferTests(unittest.TestCase):
         config = ServerConfig(
             listen="127.0.0.1",
             port=9443,
+            tls_enabled=False,
             cert_file=self.base / "cert.pem",
             key_file=self.base / "key.pem",
-            auth_token_sha256=hashlib.sha256(b"token").hexdigest(),
+            auth_password_sha256=hashlib.sha256(b"password").hexdigest(),
             allowed_roots=[self.root.resolve()],
             state_dir=self.base / "state",
             chunk_size=4,
@@ -154,8 +156,8 @@ class ServerTransferTests(unittest.TestCase):
         self.assertFalse(partial.exists())
         self.assertTrue(restarted.store.get(state["id"])["objects_cleaned"])
 
-    def test_authentication_uses_token_digest(self):
-        self.assertTrue(self.app.authenticated("Bearer token"))
+    def test_authentication_uses_password_digest(self):
+        self.assertTrue(self.app.authenticated("Bearer password"))
         self.assertFalse(self.app.authenticated("Bearer wrong"))
         self.assertFalse(self.app.authenticated(None))
 
@@ -181,7 +183,7 @@ class ServerTransferTests(unittest.TestCase):
                 "/v1/transfers/upload",
                 body=body,
                 headers={
-                    "Authorization": "Bearer token",
+                    "Authorization": "Bearer password",
                     "Content-Type": "application/json",
                 },
             )
@@ -191,6 +193,23 @@ class ServerTransferTests(unittest.TestCase):
             self.assertEqual(value["direction"], "upload")
             self.assertEqual(value["chunks"], 3)
             connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_api_client_authenticates_over_explicit_http(self):
+        server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            api = ApiClient(
+                "http://127.0.0.1:%d" % server.server_port,
+                "password",
+                timeout=5,
+            )
+            health = api.request("GET", "/v1/health")
+            self.assertEqual(health["status"], "ok")
         finally:
             server.shutdown()
             server.server_close()

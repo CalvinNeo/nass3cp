@@ -33,13 +33,18 @@ class ApiClient:
     def __init__(
         self,
         base_url: str,
-        token: str,
+        password: str,
         ca_file: Optional[str] = None,
         insecure: bool = False,
         timeout: int = 30,
     ):
         self.base_url = base_url.rstrip("/")
-        self.token = token
+        parsed = urlsplit(self.base_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ProtocolError("NAS service URL must use HTTP or HTTPS")
+        if parsed.scheme == "http" and (ca_file is not None or insecure):
+            raise ProtocolError("TLS options cannot be used with an HTTP NAS service")
+        self.password = password
         self.timeout = timeout
         if insecure:
             self.context = ssl._create_unverified_context()  # nosec - explicit CLI opt-in
@@ -51,7 +56,7 @@ class ApiClient:
     def request(self, method: str, path: str, body: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         data = None
         headers = {
-            "Authorization": "Bearer " + self.token,
+            "Authorization": "Bearer " + self.password,
             "Accept": "application/json",
         }
         if body is not None:

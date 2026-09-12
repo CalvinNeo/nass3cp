@@ -93,6 +93,14 @@ def fake_data_request(api):
 
 
 class ClientTransferTests(unittest.TestCase):
+    def test_control_client_allows_explicit_http(self):
+        api = client.ApiClient("http://127.0.0.1:9443", "password")
+        self.assertEqual(api.base_url, "http://127.0.0.1:9443")
+
+    def test_control_client_rejects_tls_options_with_http(self):
+        with self.assertRaises(ProtocolError):
+            client.ApiClient("http://127.0.0.1:9443", "password", insecure=True)
+
     def test_upload_reads_hashes_and_sends_all_chunks(self):
         content = b"abcdefghij"
         api = FakeApi()
@@ -122,4 +130,3 @@ class ClientTransferTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
