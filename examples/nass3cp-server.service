@@ -1,0 +1,23 @@
+[Unit]
+Description=nass3cp NAS relay service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nass3cp
+Group=nass3cp
+EnvironmentFile=/etc/nass3cp/nass3cp.env
+ExecStart=/opt/nass3cp/.venv/bin/nass3cp-server --config /etc/nass3cp/server.json
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Adjust these paths to match state_dir and allowed_roots in server.json.
+ReadWritePaths=/var/lib/nass3cp /volume1/share
+
+[Install]
+WantedBy=multi-user.target

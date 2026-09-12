@@ -1,0 +1,31 @@
+{
+  "listen": "0.0.0.0",
+  "port": 9443,
+  "tls": {
+    "cert_file": "/etc/nass3cp/server.crt",
+    "key_file": "/etc/nass3cp/server.key"
+  },
+  "auth": {
+    "token": "${NASS3CP_TOKEN}"
+  },
+  "allowed_roots": [
+    "/volume1/share"
+  ],
+  "state_dir": "/var/lib/nass3cp",
+  "chunk_size": 67108864,
+  "transfer_ttl_seconds": 86400,
+  "max_file_size": 1099511627776,
+  "s3": {
+    "endpoint": "https://s3.oss-cn-hangzhou.aliyuncs.com",
+    "region": "cn-hangzhou",
+    "bucket": "replace-with-your-private-bucket",
+    "access_key_id": "${ALIBABA_CLOUD_ACCESS_KEY_ID}",
+    "secret_access_key": "${ALIBABA_CLOUD_ACCESS_KEY_SECRET}",
+    "prefix": "nass3cp",
+    "addressing_style": "virtual",
+    "url_ttl_seconds": 900,
+    "put_headers": {
+      "x-amz-server-side-encryption": "AES256"
+    }
+  }
+}
