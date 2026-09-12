@@ -13,7 +13,7 @@ NAS  ──HTTPS──► R2/S3 ──HTTPS──► 本机    # 从 NAS 下载
 ## 安全模型
 
 - NAS API 使用密码认证。客户端默认在终端安全提示输入密码，不需要把密码保存在客户端配置或命令行历史中。
-- 控制通道可选择应用层 TLS 1.2+，或在 ZeroTier/OpenTier、已启用加密的 FRP 等可信隧道内使用 HTTP。后者必须显式传 `--no-tls`，且服务端禁止监听通配地址。
+- 控制通道可选择应用层 TLS 1.2+，或在 ZeroTier/OpenTier、已启用加密的 FRP 等可信隧道内使用 HTTP。后者必须显式传 `--no-tls`。
 - 内网 IP 本身不提供加密；使用无 TLS 模式时，保密性和完整性完全由覆盖网络或隧道承担。密码会作为每个控制请求的 Bearer 凭证发送，因此绝不能在未加密网络上使用该模式。
 - S3 Endpoint 和客户端拿到的预签名 URL 始终必须是 HTTPS；无 TLS 模式不会降低文件数据通道的要求。
 - S3 Secret Access Key 只保存在 NAS 服务端；客户端只得到最长 1 小时、只允许操作单个分块的预签名 URL（URL 中的 Access Key ID 本身不是秘密）。
@@ -33,7 +33,7 @@ chmod 700 bin/nass3cp bin/nass3cp-server
 chmod 600 config/server.env
 ```
 
-使用覆盖网络时编辑 `config/server.overlay.json` 和 `config/server.env`，不需要证书；使用 TLS 时编辑 `config/server.json`，把证书和私钥放到 `config/server.crt`、`config/server.key`，并将私钥权限设为 `600`。启动器会从当前项目的 `src/` 加载代码并自动读取项目内的 `config/server.env`，不需要 virtualenv、`pip install` 或 systemctl。
+项目内的 `config/server.json` 默认就是无应用层 TLS 的密码模式，不需要证书。编辑它和 `config/server.env` 后即可启动。启动器会从当前项目的 `src/` 加载代码并自动读取项目内配置，不需要 virtualenv、`pip install` 或 systemctl。仍需 TLS 时可以参考 `examples/server.cloudflare-r2.json`。
 
 如果希望安装成系统命令，原来的 `python3 -m pip install /path/to/nass3cp` 方式仍然可用，此时命令名是 `nass3cp` 和 `nass3cp-server`。
 
@@ -76,7 +76,7 @@ Cloudflare R2 支持本程序使用的 SigV4 预签名 PUT、GET 和 DELETE。R2
 
 ## 服务端配置
 
-项目内的 [`config/server.json`](config/server.json) 已是 Cloudflare R2 模板。修改其中的 Account ID、Bucket、NAS 路径和 TLS 文件，再从 [`config/server.env.example`](config/server.env.example) 创建不会提交到 Git 的 `config/server.env`：
+项目内的 [`config/server.json`](config/server.json) 已是“Cloudflare R2 + 无应用层 TLS + 密码认证”模板。修改其中的 Account ID、Bucket、NAS 路径和监听地址，再从 [`config/server.env.example`](config/server.env.example) 创建不会提交到 Git 的 `config/server.env`：
 
 ```text
 NASS3CP_PASSWORD=用密码管理器生成的高强度随机密码
@@ -96,26 +96,39 @@ export ALIBABA_CLOUD_ACCESS_KEY_SECRET='...'
 
 `auth.password` 既可以直接写字符串，也可以像模板一样引用项目内 `server.env` 的 `${NASS3CP_PASSWORD}`。推荐后者，避免误把密码提交到 Git。旧版的 `auth.token` 和 `NASS3CP_TOKEN` 仍兼容。
 
-有两种控制通道配置：
-
-- `config/server.json`：启用 TLS。使用公网域名时可用受信任 CA 的证书；内网域名/IP 可建立自己的 CA。证书的 SAN 必须包含客户端传给 `--host` 的域名或 IP。
-- `config/server.overlay.json`：不使用应用层 TLS。默认只监听 `127.0.0.1`，适合同机 FRP；用于 ZeroTier/OpenTier 时，将 `listen` 改成 NAS 的覆盖网络虚拟 IP。无 TLS 模式拒绝 `0.0.0.0` 和 `::`。
+`config/server.json` 默认不使用应用层 TLS，并监听 `0.0.0.0:9443`。这会接受所有网卡上的连接；请用 NAS 防火墙把 TCP 9443 限制到覆盖网络网段，或者把 `listen` 改成 NAS 的覆盖网络虚拟 IP。仅供同机 FRP 使用时可以改成 `127.0.0.1`。
 
 启动并先检查配置：
 
 ```bash
-./bin/nass3cp-server --config config/server.overlay.json --check-config
-./bin/nass3cp-server --config config/server.overlay.json --check-s3
-./bin/nass3cp-server --config config/server.overlay.json
+./bin/nass3cp-server --check-config
+./bin/nass3cp-server --check-s3
+./bin/nass3cp-server
 ```
 
 `--check-s3` 会通过配置的中转服务 PUT 一个几十字节的临时对象、GET 校验并 DELETE；它用于确认 Endpoint、Bucket、凭证和权限确实可用。
 
-TLS 模板默认监听 `0.0.0.0:9443`；覆盖网络模板默认监听 `127.0.0.1:9443`，用于 ZeroTier/OpenTier 时必须改成 NAS 的虚拟 IP。
+默认配置监听 `0.0.0.0:9443`。建议通过 NAS 防火墙限制来源，或改为只监听 NAS 的覆盖网络虚拟 IP。
 
-需要退出 SSH 后继续运行时，先执行 `mkdir -p run`，再使用 `nohup ./bin/nass3cp-server --config config/server.overlay.json >run/nass3cp.log 2>&1 &`。完整的启动、PID、日志和停止命令见 [`docs/cloudflare-r2.md`](docs/cloudflare-r2.md)。SigV4 对时钟敏感，请确保 NAS 时间已自动同步。
+需要退出 SSH 后继续运行时，先执行 `mkdir -p run`，再使用 `nohup ./bin/nass3cp-server >run/nass3cp.log 2>&1 &`。完整的启动、PID、日志和停止命令见 [`docs/cloudflare-r2.md`](docs/cloudflare-r2.md)。SigV4 对时钟敏感，请确保 NAS 时间已自动同步。
 
 ## 使用
+
+Windows 不会执行无扩展名文件中的 shebang，请使用项目内的 `bin\nass3cp.cmd`。它会依次寻找 `py -3`、`python` 或 `python3`，并要求 Python 3.8+。例如在 PowerShell 中从 NAS 下载到当前目录：
+
+```powershell
+.\bin\nass3cp.cmd --no-tls --host 10.10.10.2 --port 9443 `
+  nas:/volume1/share/movie.mkv .
+```
+
+如果 Python 没有加入 `PATH`，可以只为当前 PowerShell 会话指定解释器：
+
+```powershell
+$env:NASS3CP_PYTHON = "C:\Path\To\Python\python.exe"
+.\bin\nass3cp.cmd --no-tls --host 10.10.10.2 nas:/volume1/share/movie.mkv .
+```
+
+Linux 和 macOS 继续使用下面的无扩展名启动器。
 
 覆盖网络模式下，本机上传到 NAS：
 

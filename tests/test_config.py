@@ -62,7 +62,9 @@ class ConfigTests(unittest.TestCase):
         ):
             config = load_server_config(str(filename))
         self.assertEqual(config.state_dir, (root / "state").resolve())
-        self.assertEqual(config.cert_file, (root / "config" / "server.crt").resolve())
+        self.assertFalse(config.tls_enabled)
+        self.assertEqual(config.listen, "0.0.0.0")
+        self.assertIsNone(config.cert_file)
 
     def test_environment_file_is_non_executable_and_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -117,23 +119,6 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.state_dir, (base / "state").resolve())
             self.assertNotEqual(config.auth_password_sha256, "password")
 
-    def test_project_local_overlay_config_is_parseable(self):
-        root = Path(__file__).resolve().parents[1]
-        filename = root / "config" / "server.overlay.json"
-        with patch.dict(
-            os.environ,
-            {
-                "NASS3CP_PASSWORD": "password",
-                "CLOUDFLARE_R2_ACCESS_KEY_ID": "exampleaccesskey",
-                "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "secret",
-            },
-            clear=False,
-        ):
-            config = load_server_config(str(filename))
-        self.assertFalse(config.tls_enabled)
-        self.assertEqual(config.listen, "127.0.0.1")
-        self.assertIsNone(config.cert_file)
-
     def test_tls_disabled_needs_no_certificate(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -158,7 +143,7 @@ class ConfigTests(unittest.TestCase):
             self.assertIsNone(config.key_file)
             self.assertIsNone(validate_server_config(config))
 
-    def test_tls_disabled_rejects_wildcard_listener(self):
+    def test_tls_disabled_allows_wildcard_listener(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             raw = {
@@ -176,8 +161,8 @@ class ConfigTests(unittest.TestCase):
             }
             filename = base / "server.json"
             filename.write_text(json.dumps(raw), encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "overlay IP or loopback"):
-                load_server_config(str(filename))
+            config = load_server_config(str(filename))
+            self.assertEqual(config.listen, "0.0.0.0")
 
     def test_rejects_plain_http_s3_endpoint(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -293,10 +293,6 @@ def load_server_config(filename: str) -> ServerConfig:
     state_dir = raw.get("state_dir", "./state")
     if not isinstance(listen, str) or not listen:
         raise ConfigError("listen must be a non-empty string")
-    if not tls_enabled and listen.strip("[]") in ("0.0.0.0", "::"):
-        raise ConfigError(
-            "TLS-disabled mode must bind an overlay IP or loopback address, not a wildcard"
-        )
     if not isinstance(state_dir, str) or not state_dir:
         raise ConfigError("state_dir must be a non-empty path string")
 

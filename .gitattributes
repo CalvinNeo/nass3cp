@@ -1,2 +1,3 @@
 bin/* text eol=lf
+bin/*.cmd text eol=crlf
 config/*.env.example text eol=lf
