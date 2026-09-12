@@ -11,6 +11,65 @@ from .errors import ConfigError
 
 
 _ENV_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+_ENV_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def load_environment_file(filename: str) -> None:
+    """Load a small, non-executable KEY=VALUE file without shell evaluation.
+
+    Existing process environment variables take precedence over file values.
+    Whole-line comments, optional ``export``, and single/double quoted values
+    are supported. Variable expansion and command substitution are deliberately
+    not supported.
+    """
+    path = Path(filename).expanduser().resolve()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ConfigError("cannot read environment file %s: %s" % (path, exc)) from exc
+
+    for line_number, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        name, separator, raw_value = line.partition("=")
+        name = name.strip()
+        if not separator or not _ENV_NAME_PATTERN.fullmatch(name):
+            raise ConfigError(
+                "invalid environment assignment in %s at line %d" % (path, line_number)
+            )
+        value = raw_value.strip()
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            if len(value) < 2 or value[-1] != quote:
+                raise ConfigError(
+                    "unterminated quoted value in %s at line %d" % (path, line_number)
+                )
+            if quote == "'":
+                value = value[1:-1]
+            else:
+                try:
+                    decoded = json.loads(value)
+                except ValueError as exc:
+                    raise ConfigError(
+                        "invalid quoted value in %s at line %d" % (path, line_number)
+                    ) from exc
+                if not isinstance(decoded, str):
+                    raise ConfigError(
+                        "invalid quoted value in %s at line %d" % (path, line_number)
+                    )
+                value = decoded
+        elif value.endswith(("'", '"')):
+            raise ConfigError(
+                "unmatched quote in %s at line %d" % (path, line_number)
+            )
+        if "\x00" in value:
+            raise ConfigError(
+                "NUL byte in environment value in %s at line %d" % (path, line_number)
+            )
+        os.environ.setdefault(name, value)
 
 
 def _expand_env(value: Any) -> Any:

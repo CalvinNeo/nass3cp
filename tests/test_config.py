@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from nass3cp.config import load_server_config
+from nass3cp.config import load_environment_file, load_server_config
 from nass3cp.errors import ConfigError
 
 
@@ -45,6 +45,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.s3.addressing_style, "virtual")
         self.assertTrue(config.s3.presign_unsigned_payload)
         self.assertEqual(config.s3.put_headers, {})
+
+    def test_project_local_cloudflare_config_is_parseable(self):
+        root = Path(__file__).resolve().parents[1]
+        filename = root / "config" / "server.json"
+        with patch.dict(
+            os.environ,
+            {
+                "NASS3CP_TOKEN": "token",
+                "CLOUDFLARE_R2_ACCESS_KEY_ID": "exampleaccesskey",
+                "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "secret",
+            },
+            clear=False,
+        ):
+            config = load_server_config(str(filename))
+        self.assertEqual(config.state_dir, (root / "state").resolve())
+        self.assertEqual(config.cert_file, (root / "config" / "server.crt").resolve())
+
+    def test_environment_file_is_non_executable_and_environment_wins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            filename = Path(directory) / "test.env"
+            filename.write_text(
+                "# comment\n"
+                "export TEST_NASS3CP_FROM_FILE='literal $HOME'\n"
+                'TEST_NASS3CP_QUOTED="line\\nvalue"\n'
+                "TEST_NASS3CP_PRECEDENCE=file\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"TEST_NASS3CP_PRECEDENCE": "environment"},
+                clear=False,
+            ):
+                load_environment_file(str(filename))
+                self.assertEqual(os.environ["TEST_NASS3CP_FROM_FILE"], "literal $HOME")
+                self.assertEqual(os.environ["TEST_NASS3CP_QUOTED"], "line\nvalue")
+                self.assertEqual(os.environ["TEST_NASS3CP_PRECEDENCE"], "environment")
 
     def test_loads_secrets_from_exact_environment_placeholders(self):
         with tempfile.TemporaryDirectory() as directory:

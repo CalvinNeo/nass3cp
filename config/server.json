@@ -1,0 +1,30 @@
+{
+  "listen": "0.0.0.0",
+  "port": 9443,
+  "tls": {
+    "cert_file": "server.crt",
+    "key_file": "server.key"
+  },
+  "auth": {
+    "token": "${NASS3CP_TOKEN}"
+  },
+  "allowed_roots": [
+    "/volume1/share"
+  ],
+  "state_dir": "../state",
+  "chunk_size": 67108864,
+  "transfer_ttl_seconds": 86400,
+  "max_file_size": 1099511627776,
+  "s3": {
+    "endpoint": "https://replace-with-account-id.r2.cloudflarestorage.com",
+    "region": "auto",
+    "bucket": "replace-with-your-private-bucket",
+    "access_key_id": "${CLOUDFLARE_R2_ACCESS_KEY_ID}",
+    "secret_access_key": "${CLOUDFLARE_R2_SECRET_ACCESS_KEY}",
+    "prefix": "nass3cp",
+    "addressing_style": "virtual",
+    "url_ttl_seconds": 900,
+    "presign_unsigned_payload": true,
+    "put_headers": {}
+  }
+}

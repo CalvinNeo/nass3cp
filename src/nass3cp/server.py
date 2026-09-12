@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import secrets
+import signal
 import ssl
 import sys
 import tempfile
@@ -19,7 +20,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
-from .config import ServerConfig, load_server_config
+from .config import ServerConfig, load_environment_file, load_server_config
 from .errors import ConfigError, Nass3cpError, S3Error
 from .s3 import S3Relay
 
@@ -685,6 +686,10 @@ class RequestHandler(BaseHTTPRequestHandler):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the nass3cp NAS-side service")
     parser.add_argument("--config", required=True, help="server JSON configuration file")
+    parser.add_argument(
+        "--env-file",
+        help="load KEY=VALUE secrets from this file before reading the configuration",
+    )
     checks = parser.add_mutually_exclusive_group()
     checks.add_argument(
         "--check-config", action="store_true", help="validate configuration and exit"
@@ -747,11 +752,21 @@ def run(config: ServerConfig) -> None:
     janitor.start()
     app.start_worker(app.cleanup_interrupted)
     LOG.info("listening with TLS on %s:%d", config.listen, config.port)
+    previous_sigterm = None
+    if threading.current_thread() is threading.main_thread() and hasattr(signal, "SIGTERM"):
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def handle_sigterm(signum: int, frame: Any) -> None:
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, handle_sigterm)
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
         app.stop()
         server.server_close()
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def main(argv: Optional[List[str]] = None) -> None:
@@ -761,6 +776,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     try:
+        if args.env_file:
+            load_environment_file(args.env_file)
         config = load_server_config(args.config)
         if args.check_config:
             validate_server_config(config)

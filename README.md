@@ -23,15 +23,17 @@ NAS  ──HTTPS──► R2/S3 ──HTTPS──► 本机    # 从 NAS 下载
 
 ## 安装
 
-在 NAS 和客户端各执行一次：
+推荐直接保留完整项目目录，不安装到系统路径。在 NAS 项目根目录执行：
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python3 -m pip install /path/to/nass3cp
+cp config/server.env.example config/server.env
+chmod 700 bin/nass3cp bin/nass3cp-server
+chmod 600 config/server.env
 ```
 
-安装后有两个命令：客户端 `nass3cp`，NAS 服务端 `nass3cp-server`。
+把 TLS 证书和私钥放到 `config/server.crt`、`config/server.key`，并将私钥权限设为 `600`。编辑 `config/server.json` 和 `config/server.env` 后，直接运行 `./bin/nass3cp-server`。启动器会从当前项目的 `src/` 加载代码，并自动读取项目内配置，不需要 virtualenv、`pip install` 或 systemctl。客户端同理使用 `./bin/nass3cp`；它会在存在时自动读取 `config/client.env`。
+
+如果希望安装成系统命令，原来的 `python3 -m pip install /path/to/nass3cp` 方式仍然可用，此时命令名是 `nass3cp` 和 `nass3cp-server`。
 
 ## Cloudflare R2 准备（推荐）
 
@@ -72,12 +74,12 @@ Cloudflare R2 支持本程序使用的 SigV4 预签名 PUT、GET 和 DELETE。R2
 
 ## 服务端配置
 
-Cloudflare R2 推荐复制 [`examples/server.cloudflare-r2.json`](examples/server.cloudflare-r2.json)，将其中的 Account ID、Bucket 和 NAS 路径改成实际值，然后设置环境变量：
+项目内的 [`config/server.json`](config/server.json) 已是 Cloudflare R2 模板。修改其中的 Account ID、Bucket、NAS 路径和 TLS 文件，再从 [`config/server.env.example`](config/server.env.example) 创建不会提交到 Git 的 `config/server.env`：
 
-```bash
-export NASS3CP_TOKEN='用密码管理器生成的高强度随机值'
-export CLOUDFLARE_R2_ACCESS_KEY_ID='...'
-export CLOUDFLARE_R2_SECRET_ACCESS_KEY='...'
+```text
+NASS3CP_TOKEN=用密码管理器生成的高强度随机值
+CLOUDFLARE_R2_ACCESS_KEY_ID=...
+CLOUDFLARE_R2_SECRET_ACCESS_KEY=...
 ```
 
 如果继续使用阿里云，则复制 [`examples/server.aliyun.json`](examples/server.aliyun.json)，并设置：
@@ -88,43 +90,43 @@ export ALIBABA_CLOUD_ACCESS_KEY_ID='LTAI...'
 export ALIBABA_CLOUD_ACCESS_KEY_SECRET='...'
 ```
 
-配置里的 `${NAME}` 只有在整个 JSON 字符串恰好是该占位符时才会展开。生产环境建议通过 systemd 的权限受限 `EnvironmentFile` 提供密钥。
+配置里的 `${NAME}` 只有在整个 JSON 字符串恰好是该占位符时才会展开。项目启动器以数据文件方式读取 `config/server.env`，不会把它作为 shell 脚本执行；外部已有环境变量优先。实际密钥文件已经列入 `.gitignore`。
 
 控制通道必须有证书。使用公网域名时可直接使用受信任 CA 的证书；内网域名/IP 可建立自己的 CA，或仅用于试验时生成自签名证书。证书的 SAN 必须包含客户端传给 `--host` 的域名或 IP。
 
 启动并先检查配置：
 
 ```bash
-nass3cp-server --config /etc/nass3cp/server.json --check-config
-nass3cp-server --config /etc/nass3cp/server.json --check-s3
-nass3cp-server --config /etc/nass3cp/server.json
+./bin/nass3cp-server --check-config
+./bin/nass3cp-server --check-s3
+./bin/nass3cp-server
 ```
 
 `--check-s3` 会通过配置的中转服务 PUT 一个几十字节的临时对象、GET 校验并 DELETE；它用于确认 Endpoint、Bucket、凭证和权限确实可用。
 
 默认监听配置文件中的 `0.0.0.0:9443`。只应通过 ZeroTier、受控 FRP 入口或防火墙白名单暴露此端口。
 
-仓库还提供了可按 NAS 路径调整的 [`examples/nass3cp-server.service`](examples/nass3cp-server.service)。SigV4 对时钟敏感，请确保 NAS 已启用 NTP/systemd-timesyncd。
+需要退出 SSH 后继续运行时，先执行 `mkdir -p run`，再使用 `nohup ./bin/nass3cp-server >run/nass3cp.log 2>&1 &`。完整的启动、PID、日志和停止命令见 [`docs/cloudflare-r2.md`](docs/cloudflare-r2.md)。SigV4 对时钟敏感，请确保 NAS 时间已自动同步。
 
 ## 使用
 
-令客户端可读取 Token。环境变量不会像命令行参数那样直接出现在进程列表中：
+从 [`config/client.env.example`](config/client.env.example) 复制出 `config/client.env`，填入与服务端相同的 Token；该文件已被 `.gitignore` 排除：
 
-```bash
-export NASS3CP_TOKEN='与服务端相同的值'
+```text
+NASS3CP_TOKEN=与服务端相同的值
 ```
 
 本机上传到 NAS：
 
 ```bash
-nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
+./bin/nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
   ./movie.mkv nas:/volume1/share/movie.mkv
 ```
 
 从 NAS 下载到本机：
 
 ```bash
-nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
+./bin/nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
   nas:/volume1/share/movie.mkv ./movie.mkv
 ```
 

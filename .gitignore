@@ -6,3 +6,8 @@ __pycache__/
 build/
 dist/
 state/
+run/
+config/server.env
+config/client.env
+config/server.crt
+config/server.key

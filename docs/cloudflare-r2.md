@@ -47,12 +47,42 @@ Cloudflare 的 R2 令牌只能限制到 Bucket，不能进一步限制到 `nass3
 
 ## 5. 配置 NAS
 
-把 [`examples/server.cloudflare-r2.json`](../examples/server.cloudflare-r2.json) 复制为 `/etc/nass3cp/server.json`，然后修改：
+整个目录可以放在 NAS 任意位置，例如 `/volume1/apps/nass3cp`。不需要把程序安装到系统目录，也不需要创建 systemd 服务：
+
+```text
+nass3cp/
+├── bin/
+│   ├── nass3cp
+│   └── nass3cp-server
+├── config/
+│   ├── server.json
+│   ├── server.env          # 从示例复制，不提交 Git
+│   ├── server.crt
+│   ├── server.key
+│   └── client.env          # 仅客户端需要
+├── src/
+├── state/                  # 首次运行自动创建
+└── run/                    # 使用 nohup 时存放日志和 PID
+```
+
+进入项目根目录并准备本地文件：
+
+```bash
+cd /volume1/apps/nass3cp
+cp config/server.env.example config/server.env
+chmod 700 bin/nass3cp bin/nass3cp-server
+chmod 600 config/server.env
+```
+
+把 NAS API 使用的 TLS 证书和私钥分别放到 `config/server.crt`、`config/server.key`，然后执行 `chmod 600 config/server.key`。
+
+直接修改项目内的 [`config/server.json`](../config/server.json)：
 
 - `s3.endpoint`：替换成 `https://ACCOUNT_ID.r2.cloudflarestorage.com`
 - `s3.bucket`：替换成第 2 步创建的 Bucket 名
 - `allowed_roots`：改成 NAS 上允许访问的真实目录
-- `tls.cert_file`、`tls.key_file` 和 `state_dir`：按实际安装路径调整
+- `tls.cert_file`、`tls.key_file`：默认指向同一 `config/` 目录内的 `server.crt` 和 `server.key`
+- `state_dir`：默认是 `../state`，按配置文件所在目录解析，即项目根目录的 `state/`
 
 以下 R2 参数应保持不变：
 
@@ -67,7 +97,7 @@ Cloudflare 的 R2 令牌只能限制到 Bucket，不能进一步限制到 `nass3
 
 `presign_unsigned_payload` 让预签名 URL 包含 R2 官方示例使用的 `X-Amz-Content-Sha256=UNSIGNED-PAYLOAD`。不要复制阿里云示例中的 `x-amz-server-side-encryption` 请求头；R2 的 S3 兼容接口不支持该 SSE-S3 请求头，但所有 R2 对象及元数据本身都会自动使用 AES-256 静态加密。
 
-可以从 [`examples/nass3cp.cloudflare-r2.env.example`](../examples/nass3cp.cloudflare-r2.env.example) 复制环境文件，将秘密放入 `/etc/nass3cp/nass3cp.env`，不要直接写进 JSON：
+编辑 [`config/server.env.example`](../config/server.env.example) 的副本 `config/server.env`，不要把实际秘密写进 JSON：
 
 ```text
 NASS3CP_TOKEN=替换为随机控制通道令牌
@@ -81,39 +111,20 @@ CLOUDFLARE_R2_SECRET_ACCESS_KEY=替换为Secret-Access-Key
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-保护配置和环境文件：
-
-```bash
-sudo chown root:nass3cp /etc/nass3cp/server.json
-sudo chmod 640 /etc/nass3cp/server.json
-sudo chown root:root /etc/nass3cp/nass3cp.env
-sudo chmod 600 /etc/nass3cp/nass3cp.env
-```
-
-JSON 不含实际密钥，但运行服务的 `nass3cp` 用户必须能够读取它。环境文件则由 systemd 在降权前读取，因此可以保持仅 root 可读。仓库中的 [`examples/nass3cp-server.service`](../examples/nass3cp-server.service) 已通过 `EnvironmentFile=/etc/nass3cp/nass3cp.env` 加载这些变量。
+`bin/nass3cp-server` 会自动读取项目内的 `config/server.env` 和 `config/server.json`。环境文件按 `KEY=VALUE` 解析，不作为 shell 脚本执行，不支持变量展开或命令替换；进程外部已经设置的环境变量优先。
 
 ## 6. 上线前验证
 
-先在一个仅 root 可读的 shell 中加载环境变量：
+在项目根目录验证本地 TLS、目录和配置：
 
 ```bash
-set -a
-. /etc/nass3cp/nass3cp.env
-set +a
-```
-
-验证本地 TLS、目录和配置：
-
-```bash
-/opt/nass3cp/.venv/bin/nass3cp-server \
-  --config /etc/nass3cp/server.json --check-config
+./bin/nass3cp-server --check-config
 ```
 
 再验证 R2 的 PUT、GET 和 DELETE。该命令只写入几十字节，读回校验后立即删除：
 
 ```bash
-/opt/nass3cp/.venv/bin/nass3cp-server \
-  --config /etc/nass3cp/server.json --check-s3
+./bin/nass3cp-server --check-s3
 ```
 
 成功输出：
@@ -122,12 +133,42 @@ set +a
 S3 relay check passed (PUT, GET, DELETE)
 ```
 
-最后启动服务并进行一次小文件测试，再测试 1 GiB 文件：
+前台启动服务：
 
 ```bash
-sudo systemctl enable --now nass3cp-server
+./bin/nass3cp-server
+```
 
-nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
+需要退出 SSH 后继续运行时，可以使用 Linux 自带的 `nohup`，仍然不依赖 systemd：
+
+```bash
+mkdir -p run
+nohup ./bin/nass3cp-server >run/nass3cp.log 2>&1 &
+echo $! >run/nass3cp.pid
+```
+
+检查进程和日志：
+
+```bash
+ps -p "$(cat run/nass3cp.pid)" -f
+tail -f run/nass3cp.log
+```
+
+确认 `ps` 显示的是本项目的 `bin/nass3cp-server` 后，可以正常停止；服务会处理 `SIGTERM` 并关闭监听端口：
+
+```bash
+kill "$(cat run/nass3cp.pid)"
+```
+
+客户端机器也可以直接保留一份项目目录，不需要安装。复制 Token 文件并测试小文件：
+
+```bash
+cp config/client.env.example config/client.env
+chmod 600 config/client.env
+
+# 编辑 config/client.env，将占位值换成与服务端相同的 NASS3CP_TOKEN
+
+./bin/nass3cp --host nas.example --port 9443 --ca-file nas-ca.crt \
   ./small-test.bin nas:/volume1/share/small-test.bin
 ```
 
