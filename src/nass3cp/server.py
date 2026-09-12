@@ -685,10 +685,43 @@ class RequestHandler(BaseHTTPRequestHandler):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the nass3cp NAS-side service")
     parser.add_argument("--config", required=True, help="server JSON configuration file")
-    parser.add_argument("--check-config", action="store_true", help="validate configuration and exit")
+    checks = parser.add_mutually_exclusive_group()
+    checks.add_argument(
+        "--check-config", action="store_true", help="validate configuration and exit"
+    )
+    checks.add_argument(
+        "--check-s3",
+        action="store_true",
+        help="write, read, and delete a small relay object, then exit",
+    )
     parser.add_argument("--verbose", action="store_true", help="enable verbose logging")
     parser.add_argument("--version", action="version", version=__version__)
     return parser
+
+
+def check_s3(config: ServerConfig) -> None:
+    """Verify the configured relay with a tiny, automatically removed object."""
+    relay = S3Relay(config.s3)
+    transfer_id = secrets.token_hex(16)
+    payload = b"nass3cp S3 relay check\n"
+    primary_error: Optional[Exception] = None
+    try:
+        relay.put_chunk(transfer_id, 0, payload)
+        response = relay.get_chunk(transfer_id, 0)
+        try:
+            received = response.read(len(payload) + 1)
+        finally:
+            response.close()
+        if received != payload:
+            raise S3Error("S3 relay check returned different data")
+    except Exception as exc:
+        primary_error = exc
+
+    cleanup_errors = relay.cleanup(transfer_id, 1)
+    if primary_error is not None:
+        raise primary_error
+    if cleanup_errors:
+        raise S3Error("S3 relay check could not delete its object: %s" % cleanup_errors[0])
 
 
 def validate_server_config(config: ServerConfig) -> ssl.SSLContext:
@@ -733,10 +766,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             validate_server_config(config)
             print("configuration is valid")
             return
+        if args.check_s3:
+            check_s3(config)
+            print("S3 relay check passed (PUT, GET, DELETE)")
+            return
         run(config)
     except KeyboardInterrupt:
         return
-    except (ConfigError, OSError) as exc:
+    except (Nass3cpError, OSError) as exc:
         print("nass3cp-server: %s" % exc, file=sys.stderr)
         raise SystemExit(2)
 

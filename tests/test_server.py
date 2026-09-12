@@ -6,9 +6,16 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from nass3cp.config import S3Config, ServerConfig
-from nass3cp.server import ApiError, Nass3cpHTTPServer, RequestHandler, ServerApp
+from nass3cp.server import (
+    ApiError,
+    Nass3cpHTTPServer,
+    RequestHandler,
+    ServerApp,
+    check_s3,
+)
 
 
 class FakeS3:
@@ -151,6 +158,11 @@ class ServerTransferTests(unittest.TestCase):
         self.assertTrue(self.app.authenticated("Bearer token"))
         self.assertFalse(self.app.authenticated("Bearer wrong"))
         self.assertFalse(self.app.authenticated(None))
+
+    def test_s3_check_round_trips_and_removes_test_object(self):
+        with mock.patch("nass3cp.server.S3Relay", return_value=self.fake):
+            check_s3(self.app.config)
+        self.assertFalse(self.fake.objects)
 
     def test_http_api_requires_auth_and_creates_upload(self):
         server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)

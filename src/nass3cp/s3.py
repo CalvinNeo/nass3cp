@@ -47,8 +47,8 @@ class S3Relay:
     """Small, dependency-free S3 SigV4 client and URL signer.
 
     All data-plane calls use short-lived presigned HTTPS URLs. This works with
-    Amazon S3 and S3-compatible endpoints such as Alibaba Cloud OSS's S3
-    compatibility endpoint.
+    Amazon S3 and S3-compatible endpoints such as Cloudflare R2 and Alibaba
+    Cloud OSS.
     """
 
     def __init__(self, config: S3Config):
@@ -113,6 +113,8 @@ class S3Relay:
             "X-Amz-Expires": str(expires or self.config.url_ttl_seconds),
             "X-Amz-SignedHeaders": signed_headers,
         }
+        if self.config.presign_unsigned_payload:
+            params["X-Amz-Content-Sha256"] = "UNSIGNED-PAYLOAD"
         if self.config.session_token:
             params["X-Amz-Security-Token"] = self.config.session_token
         query = _canonical_query(params)

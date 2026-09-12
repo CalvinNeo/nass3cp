@@ -25,6 +25,27 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.s3.endpoint, "https://s3.oss-cn-hangzhou.aliyuncs.com")
         self.assertEqual(config.chunk_size, 64 * 1024 * 1024)
 
+    def test_cloudflare_r2_example_is_parseable(self):
+        filename = (
+            Path(__file__).resolve().parents[1]
+            / "examples"
+            / "server.cloudflare-r2.json"
+        )
+        with patch.dict(
+            os.environ,
+            {
+                "NASS3CP_TOKEN": "token",
+                "CLOUDFLARE_R2_ACCESS_KEY_ID": "exampleaccesskey",
+                "CLOUDFLARE_R2_SECRET_ACCESS_KEY": "secret",
+            },
+            clear=False,
+        ):
+            config = load_server_config(str(filename))
+        self.assertEqual(config.s3.region, "auto")
+        self.assertEqual(config.s3.addressing_style, "virtual")
+        self.assertTrue(config.s3.presign_unsigned_payload)
+        self.assertEqual(config.s3.put_headers, {})
+
     def test_loads_secrets_from_exact_environment_placeholders(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

@@ -64,6 +64,7 @@ class S3Config:
     addressing_style: str
     url_ttl_seconds: int
     put_headers: Dict[str, str]
+    presign_unsigned_payload: bool = False
 
 
 @dataclass(frozen=True)
@@ -128,6 +129,10 @@ def _load_s3(raw: Mapping[str, Any]) -> S3Config:
     if ttl > 3600:
         raise ConfigError("s3.url_ttl_seconds must not exceed 3600")
 
+    presign_unsigned_payload = raw.get("presign_unsigned_payload", False)
+    if not isinstance(presign_unsigned_payload, bool):
+        raise ConfigError("s3.presign_unsigned_payload must be a boolean")
+
     bucket = _require(raw, "bucket", str).strip()
     region = _require(raw, "region", str).strip()
     access_key_id = _require(raw, "access_key_id", str).strip()
@@ -161,6 +166,7 @@ def _load_s3(raw: Mapping[str, Any]) -> S3Config:
         addressing_style=style,
         url_ttl_seconds=ttl,
         put_headers=headers,
+        presign_unsigned_payload=presign_unsigned_payload,
     )
 
 

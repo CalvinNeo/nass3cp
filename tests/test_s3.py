@@ -68,6 +68,35 @@ class S3SigningTests(unittest.TestCase):
         self.assertEqual(urlsplit(signed.url).netloc, "storage.example.test")
         self.assertEqual(urlsplit(signed.url).path, "/base/bucket-name/dir/a%20b.txt")
 
+    def test_cloudflare_r2_virtual_host_and_scope(self):
+        relay = S3Relay(
+            self.config(
+                endpoint="https://0123456789abcdef.r2.cloudflarestorage.com",
+                bucket="nass3cp-relay",
+                region="auto",
+                presign_unsigned_payload=True,
+            )
+        )
+        signed = relay.presign_chunk(
+            "PUT",
+            "a" * 32,
+            0,
+            content_length=64 * 1024 * 1024,
+        )
+        parsed = urlsplit(signed.url)
+        query = parse_qs(parsed.query)
+        self.assertEqual(
+            parsed.netloc,
+            "nass3cp-relay.0123456789abcdef.r2.cloudflarestorage.com",
+        )
+        self.assertIn("%2Fauto%2Fs3%2Faws4_request", parsed.query)
+        self.assertEqual(
+            query["X-Amz-SignedHeaders"],
+            ["content-length;content-type;host"],
+        )
+        self.assertEqual(query["X-Amz-Content-Sha256"], ["UNSIGNED-PAYLOAD"])
+        self.assertNotIn("x-amz-server-side-encryption", signed.headers)
+
 
 if __name__ == "__main__":
     unittest.main()
