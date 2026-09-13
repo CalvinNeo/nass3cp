@@ -1,6 +1,8 @@
 import hashlib
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,14 +81,22 @@ class FakeApi:
 
 
 def fake_data_request(api):
-    def request(method, item, data=None, expected=None, attempts=4):
+    def request(method, item, data=None, expected=None, attempts=4, progress=None):
         index = int(item["url"].rsplit("/", 1)[1])
         if method == "PUT":
+            if progress is not None:
+                progress(len(data) // 2)
             api.objects[index] = data
+            if progress is not None:
+                progress(len(data))
             return b""
         value = api.objects[index]
+        if progress is not None:
+            progress(len(value) // 2)
         if expected is not None and len(value) != expected:
             raise ProtocolError("wrong fake chunk size")
+        if progress is not None:
+            progress(len(value))
         return value
 
     return request
@@ -126,6 +136,55 @@ class ClientTransferTests(unittest.TestCase):
     def test_data_plane_rejects_plain_http_before_connecting(self):
         with self.assertRaises(ProtocolError):
             client._data_request("GET", {"url": "http://example.test/a", "headers": {}})
+
+    def test_upload_prints_both_progress_stages(self):
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abcdefghij")
+            output = io.StringIO()
+            with patch(
+                "nass3cp.client._data_request", side_effect=fake_data_request(api)
+            ), redirect_stderr(output):
+                client.upload(api, str(source), "dest.bin", False, 2, 60, False)
+        rendered = output.getvalue()
+        self.assertIn("upload to S3:", rendered)
+        self.assertIn("copy from S3 to NAS:", rendered)
+        self.assertGreaterEqual(rendered.count("100.0%"), 2)
+
+    def test_download_prints_both_progress_stages(self):
+        api = FakeApi(b"0123456789")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination.bin"
+            output = io.StringIO()
+            with patch(
+                "nass3cp.client._data_request", side_effect=fake_data_request(api)
+            ), redirect_stderr(output):
+                client.download(api, "source.bin", str(destination), False, 2, 60, False)
+        rendered = output.getvalue()
+        self.assertIn("copy from NAS to S3:", rendered)
+        self.assertIn("download from S3:", rendered)
+        self.assertGreaterEqual(rendered.count("100.0%"), 2)
+
+    def test_quiet_suppresses_progress(self):
+        api = FakeApi()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(b"abcdefghij")
+            output = io.StringIO()
+            with patch(
+                "nass3cp.client._data_request", side_effect=fake_data_request(api)
+            ), redirect_stderr(output):
+                client.upload(api, str(source), "dest.bin", False, 2, 60, True)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_progress_reader_reports_bytes_while_body_is_read(self):
+        reported = []
+        reader = client._ProgressReader(b"abcdef", reported.append)
+        self.assertEqual(reader.read(2), b"ab")
+        self.assertEqual(reported, [])
+        self.assertEqual(reader.read(), b"cdef")
+        self.assertEqual(reported, [6])
 
 
 if __name__ == "__main__":
