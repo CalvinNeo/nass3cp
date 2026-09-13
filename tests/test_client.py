@@ -1,6 +1,8 @@
 import hashlib
 import io
+import json
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -20,7 +22,23 @@ class FakeApi:
         self.aborted = False
         self.max_objects = 0
 
-    def create_upload(self, path, size, mtime_ns, overwrite, inflight=None):
+    def create_upload(
+        self,
+        path,
+        size,
+        mtime_ns,
+        overwrite,
+        inflight=None,
+        resume=False,
+        resume_id=None,
+    ):
+        if (
+            resume
+            and resume_id == self.transfer_id
+            and self.current.get("direction") == "upload"
+        ):
+            self.current["resumed"] = True
+            return dict(self.current)
         self.current = {
             "id": self.transfer_id,
             "direction": "upload",
@@ -29,10 +47,19 @@ class FakeApi:
             "chunks": (size + 3) // 4,
             "chunk_size": 4,
             "bytes_transferred": 0,
+            "resumable": resume,
+            "resumed": False,
         }
         return dict(self.current)
 
-    def create_download(self, path, inflight=None):
+    def create_download(self, path, inflight=None, resume=False, resume_id=None):
+        if (
+            resume
+            and resume_id == self.transfer_id
+            and self.current.get("direction") == "download"
+        ):
+            self.current["resumed"] = True
+            return dict(self.current)
         size = len(self.remote_content)
         self.current = {
             "id": self.transfer_id,
@@ -44,6 +71,8 @@ class FakeApi:
             "bytes_transferred": size,
             "sha256": hashlib.sha256(self.remote_content).hexdigest(),
             "mtime_ns": 1000000000,
+            "resumable": resume,
+            "resumed": False,
         }
         for index in range(self.current["chunks"]):
             self.objects[index] = self.remote_content[index * 4 : index * 4 + 4]
@@ -210,6 +239,32 @@ class PipelineDownloadApi(FakeApi):
         return dict(self.current)
 
 
+class IncrementalPipelineDownloadApi(PipelineDownloadApi):
+    def _fill(self):
+        if (
+            self.current["chunks_staged"] < self.current["chunks"]
+            and self.current["chunks_staged"] - self.current["chunks_consumed"]
+            < self.inflight
+        ):
+            index = self.current["chunks_staged"]
+            self.objects[index] = self.remote_content[index * 4 : index * 4 + 4]
+            self.current["chunks_staged"] += 1
+            self.current["bytes_transferred"] += len(self.objects[index])
+            self.max_objects = max(self.max_objects, len(self.objects))
+        if self.current["chunks_staged"] == self.current["chunks"]:
+            self.current.update(
+                {
+                    "status": "ready",
+                    "producer_complete": True,
+                    "sha256": hashlib.sha256(self.remote_content).hexdigest(),
+                }
+            )
+
+    def state(self, transfer_id):
+        self._fill()
+        return dict(self.current)
+
+
 class ListApi:
     def __init__(self):
         self.calls = []
@@ -280,6 +335,59 @@ class ClientTransferTests(unittest.TestCase):
         self.assertLessEqual(api.max_objects, 3)
         self.assertFalse(api.objects)
 
+    def test_resumable_upload_records_each_completed_block_and_only_retries_missing(self):
+        content = b"abcdefghijkl"
+        api = FakeApi()
+        attempts = {}
+        request = fake_data_request(api)
+
+        def fail_first_block_once(method, item, data=None, expected=None, attempts_count=4, progress=None):
+            index = int(item["url"].rsplit("/", 1)[1])
+            attempts[index] = attempts.get(index, 0) + 1
+            if method == "PUT" and index == 0 and attempts[index] == 1:
+                raise ProtocolError("simulated interruption")
+            return request(method, item, data, expected, attempts_count, progress)
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(content)
+            checkpoint = client._resume_path(source, "upload")
+            with patch(
+                "nass3cp.client._data_request", side_effect=fail_first_block_once
+            ), self.assertRaises(ProtocolError):
+                client.upload(
+                    api,
+                    str(source),
+                    "dest.bin",
+                    False,
+                    2,
+                    60,
+                    True,
+                    resume=True,
+                )
+
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(set(saved["completed"]), {"1"})
+
+            with patch(
+                "nass3cp.client._data_request", side_effect=fail_first_block_once
+            ):
+                client.upload(
+                    api,
+                    str(source),
+                    "dest.bin",
+                    False,
+                    2,
+                    60,
+                    True,
+                    resume=True,
+                )
+
+            self.assertFalse(checkpoint.exists())
+        self.assertEqual(attempts, {0: 2, 1: 1, 2: 1})
+        self.assertEqual(b"".join(api.objects[index] for index in sorted(api.objects)), content)
+        self.assertFalse(api.aborted)
+
     def test_download_verifies_and_atomically_writes_file(self):
         content = b"0123456789"
         api = FakeApi(content)
@@ -302,6 +410,94 @@ class ClientTransferTests(unittest.TestCase):
         self.assertTrue(api.acknowledged)
         self.assertLessEqual(api.max_objects, 3)
         self.assertFalse(api.objects)
+
+    def test_resumable_download_keeps_out_of_order_blocks_and_only_requests_missing(self):
+        content = b"abcdefghijkl"
+        api = FakeApi(content)
+        attempts = {}
+        request = fake_data_request(api)
+
+        def fail_first_block_once(method, item, data=None, expected=None, attempts_count=4, progress=None):
+            index = int(item["url"].rsplit("/", 1)[1])
+            attempts[index] = attempts.get(index, 0) + 1
+            if method == "GET" and index == 0 and attempts[index] == 1:
+                raise ProtocolError("simulated interruption")
+            return request(method, item, data, expected, attempts_count, progress)
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination.bin"
+            checkpoint = client._resume_path(destination, "download")
+            with patch(
+                "nass3cp.client._data_request", side_effect=fail_first_block_once
+            ), self.assertRaises(ProtocolError):
+                client.download(
+                    api,
+                    "source.bin",
+                    str(destination),
+                    False,
+                    2,
+                    60,
+                    True,
+                    resume=True,
+                )
+
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(set(saved["completed"]), {"1"})
+
+            with patch(
+                "nass3cp.client._data_request", side_effect=fail_first_block_once
+            ):
+                client.download(
+                    api,
+                    "source.bin",
+                    str(destination),
+                    False,
+                    2,
+                    60,
+                    True,
+                    resume=True,
+                )
+
+            self.assertEqual(destination.read_bytes(), content)
+            self.assertFalse(checkpoint.exists())
+            self.assertFalse(list(Path(directory).glob("*.nass3cp-part")))
+        self.assertEqual(attempts, {0: 2, 1: 1, 2: 1})
+        self.assertTrue(api.acknowledged)
+
+    def test_pipeline_download_refills_jobs_while_requests_are_active(self):
+        content = b"abcdefgh"
+        api = IncrementalPipelineDownloadApi(content)
+        second_started = threading.Event()
+        first_saw_second = []
+        concurrency_lock = threading.Lock()
+        active_requests = 0
+        max_active_requests = 0
+        request = fake_data_request(api)
+
+        def delayed_request(method, item, data=None, expected=None, attempts=4, progress=None):
+            nonlocal active_requests, max_active_requests
+            index = int(item["url"].rsplit("/", 1)[1])
+            with concurrency_lock:
+                active_requests += 1
+                max_active_requests = max(max_active_requests, active_requests)
+            try:
+                if index == 1:
+                    second_started.set()
+                elif index == 0:
+                    first_saw_second.append(second_started.wait(timeout=1.0))
+                return request(method, item, data, expected, attempts, progress)
+            finally:
+                with concurrency_lock:
+                    active_requests -= 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination.bin"
+            with patch("nass3cp.client._data_request", side_effect=delayed_request):
+                client.download(api, "source.bin", str(destination), False, 2, 60, True, 2)
+            self.assertEqual(destination.read_bytes(), content)
+
+        self.assertEqual(first_saw_second, [True])
+        self.assertEqual(max_active_requests, 2)
 
     def test_data_plane_rejects_plain_http_before_connecting(self):
         with self.assertRaises(ProtocolError):

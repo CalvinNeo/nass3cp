@@ -21,6 +21,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
+from .compression import DecodingWriter, gzip_compress_stream
 from .config import ServerConfig, load_environment_file, load_server_config
 from .errors import ConfigError, Nass3cpError, S3Error
 from .s3 import S3Relay
@@ -44,6 +45,12 @@ PUBLIC_FIELDS = (
     "chunks_staged",
     "chunks_consumed",
     "producer_complete",
+    "compression",
+    "decoded_size",
+    "decoded_sha256",
+    "metadata_ready",
+    "resumable",
+    "resumed",
     "created_at",
     "updated_at",
     "error",
@@ -204,51 +211,148 @@ class ServerApp:
         actual = hashlib.sha256(password.encode("utf-8")).hexdigest()
         return hmac.compare_digest(actual, self.config.auth_password_sha256)
 
-    def resolve_remote(self, requested: str, write: bool, overwrite: bool = False) -> Path:
+    def _remote_lexical_candidate(self, requested: str) -> Path:
         if not requested or "\x00" in requested:
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_path", "invalid NAS path")
         raw = Path(requested)
         if raw.is_absolute():
-            candidate = raw.resolve(strict=False)
-        else:
-            candidate = (self.config.allowed_roots[0] / raw).resolve(strict=False)
-        if not any(_inside(candidate, root) for root in self.config.allowed_roots):
-            raise ApiError(HTTPStatus.FORBIDDEN, "path_not_allowed", "NAS path is outside allowed roots")
-        if write:
-            if not candidate.parent.is_dir():
-                raise ApiError(HTTPStatus.BAD_REQUEST, "parent_missing", "destination directory does not exist")
-            if candidate.exists():
-                if candidate.is_dir():
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "not_a_file", "destination is a directory")
-                if not overwrite:
-                    raise ApiError(HTTPStatus.CONFLICT, "destination_exists", "destination already exists; use --overwrite")
-        elif not candidate.is_file():
-            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "source is not a regular file")
-        return candidate
+            return raw
+        return self.config.allowed_roots[0] / raw
 
-    def resolve_remote_directory(self, requested: str) -> Path:
-        if "\x00" in requested:
-            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_path", "invalid NAS path")
-        raw = Path(requested or ".")
-        if raw.is_absolute():
-            candidate = raw.resolve(strict=False)
-        else:
-            candidate = (self.config.allowed_roots[0] / raw).resolve(strict=False)
+    def _remote_candidate(self, requested: str) -> Path:
+        candidate = self._remote_lexical_candidate(requested).resolve(strict=False)
         if not any(_inside(candidate, root) for root in self.config.allowed_roots):
             raise ApiError(
                 HTTPStatus.FORBIDDEN,
                 "path_not_allowed",
                 "NAS path is outside allowed roots",
             )
-        if not candidate.exists():
+        return candidate
+
+    def resolve_remote(self, requested: str, write: bool, overwrite: bool = False) -> Path:
+        lexical = self._remote_lexical_candidate(requested)
+        candidate = self._remote_candidate(requested)
+        try:
+            lexical_details = lexical.lstat()
+        except FileNotFoundError:
+            lexical_details = None
+        if write:
+            if not candidate.parent.is_dir():
+                raise ApiError(HTTPStatus.BAD_REQUEST, "parent_missing", "destination directory does not exist")
+            if lexical_details is not None:
+                if not stat.S_ISREG(lexical_details.st_mode):
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "not_a_file",
+                        "destination is not a regular file",
+                    )
+                if not overwrite:
+                    raise ApiError(HTTPStatus.CONFLICT, "destination_exists", "destination already exists; use --overwrite")
+        elif lexical_details is None or not stat.S_ISREG(lexical_details.st_mode):
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "source is not a regular file")
+        return candidate
+
+    def resolve_remote_directory(self, requested: str) -> Path:
+        normalized = requested or "."
+        lexical = self._remote_lexical_candidate(normalized)
+        candidate = self._remote_candidate(normalized)
+        try:
+            details = lexical.lstat()
+        except FileNotFoundError:
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "NAS directory does not exist")
-        if not candidate.is_dir():
+        if not stat.S_ISDIR(details.st_mode):
             raise ApiError(
                 HTTPStatus.BAD_REQUEST,
                 "not_a_directory",
                 "NAS path is not a directory",
             )
         return candidate
+
+    def path_info(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        requested = body.get("path")
+        if not isinstance(requested, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
+        lexical = self._remote_lexical_candidate(requested)
+        candidate = self._remote_candidate(requested)
+        try:
+            details = lexical.lstat()
+        except FileNotFoundError:
+            return {"exists": False}
+        except PermissionError as exc:
+            raise ApiError(
+                HTTPStatus.FORBIDDEN,
+                "permission_denied",
+                "permission denied while inspecting NAS path",
+            ) from exc
+        if stat.S_ISDIR(details.st_mode):
+            kind = "directory"
+        elif stat.S_ISREG(details.st_mode):
+            kind = "file"
+        else:
+            kind = "other"
+        return {
+            "exists": True,
+            "type": kind,
+            "size": details.st_size if kind == "file" else None,
+            "mtime_ns": details.st_mtime_ns,
+        }
+
+    def ensure_directory(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        requested = body.get("path")
+        if not isinstance(requested, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
+        lexical = self._remote_lexical_candidate(requested)
+        candidate = self._remote_candidate(requested)
+        try:
+            details = lexical.lstat()
+        except FileNotFoundError:
+            details = None
+        if details is not None:
+            if not stat.S_ISDIR(details.st_mode):
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "path_conflict",
+                    "NAS directory path already exists as a non-directory",
+                )
+            return {"created": False}
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+            resolved = candidate.resolve(strict=True)
+        except FileExistsError as exc:
+            try:
+                raced_details = lexical.lstat()
+            except OSError:
+                raced_details = None
+            if raced_details is not None and stat.S_ISDIR(raced_details.st_mode):
+                return {"created": False}
+            raise ApiError(
+                HTTPStatus.CONFLICT,
+                "path_conflict",
+                "NAS directory path already exists as a non-directory",
+            ) from exc
+        except PermissionError as exc:
+            raise ApiError(
+                HTTPStatus.FORBIDDEN,
+                "permission_denied",
+                "permission denied while creating NAS directory",
+            ) from exc
+        except OSError as exc:
+            raise ApiError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "mkdir_failed",
+                "could not create NAS directory",
+            ) from exc
+        if not any(_inside(resolved, root) for root in self.config.allowed_roots):
+            try:
+                candidate.rmdir()
+            except OSError:
+                pass
+            raise ApiError(
+                HTTPStatus.FORBIDDEN,
+                "path_not_allowed",
+                "created directory left an allowed root",
+            )
+        return {"created": True}
 
     def list_directory(self, body: Mapping[str, Any]) -> Dict[str, Any]:
         requested = body.get("path")
@@ -340,6 +444,10 @@ class ServerApp:
         size = body.get("size")
         overwrite = body.get("overwrite", False)
         mtime_ns = body.get("mtime_ns")
+        compression = body.get("compression")
+        decoded_size = body.get("decoded_size")
+        resumable = body.get("resume", False)
+        resume_id = body.get("resume_id")
         pipeline = "inflight" in body
         inflight = body.get("inflight")
         if not isinstance(requested, str):
@@ -350,6 +458,24 @@ class ServerApp:
             raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "file_too_large", "file exceeds server max_file_size")
         if not isinstance(overwrite, bool):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "overwrite must be a boolean")
+        if not isinstance(resumable, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "resume must be a boolean")
+        if resume_id is not None and (
+            not resumable
+            or not isinstance(resume_id, str)
+            or not TRANSFER_ID.fullmatch(resume_id)
+        ):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resume_id must be a transfer id and requires resume",
+            )
+        if resumable and pipeline:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resumable uploads cannot use the bounded pipeline",
+            )
         if mtime_ns is not None and (isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int) or mtime_ns < 0):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "mtime_ns must be a non-negative integer")
         if pipeline and (
@@ -363,6 +489,78 @@ class ServerApp:
                 "invalid_request",
                 "inflight must be an integer between 1 and 128",
             )
+        if compression not in (None, "gzip"):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "compression must be gzip when provided",
+            )
+        if compression == "gzip":
+            if not pipeline:
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    "compressed uploads require the pipeline protocol",
+                )
+            if (
+                isinstance(decoded_size, bool)
+                or not isinstance(decoded_size, int)
+                or decoded_size < 0
+                or decoded_size > self.config.max_file_size
+            ):
+                raise ApiError(
+                    HTTPStatus.BAD_REQUEST,
+                    "invalid_request",
+                    "decoded_size must be within the server file size limit",
+                )
+        elif decoded_size is not None:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "decoded_size requires gzip compression",
+            )
+        if resumable and compression is not None:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resumable uploads cannot use compression",
+            )
+
+        requested_destination = self._remote_candidate(requested)
+        if resume_id is not None:
+            try:
+                previous = self.store.get(resume_id)
+            except ApiError as exc:
+                if exc.code != "not_found":
+                    raise
+                previous = None
+            if previous is not None:
+                matches = (
+                    previous.get("direction") == "upload"
+                    and previous.get("resumable") is True
+                    and previous.get("pipeline") is not True
+                    and previous.get("compression") is None
+                    and previous.get("path") == str(requested_destination)
+                    and previous.get("size") == size
+                    and previous.get("mtime_ns") == mtime_ns
+                    and previous.get("overwrite") == overwrite
+                )
+                if not matches:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "resume_mismatch",
+                        "saved upload does not match this source and destination",
+                    )
+                status = previous.get("status")
+                completed_file = requested_destination.is_file() and (
+                    requested_destination.stat().st_size == size
+                )
+                if status in ("awaiting_upload", "receiving") or (
+                    status == "complete" and completed_file
+                ):
+                    state = self.store.update(resume_id)
+                    state["resumed"] = True
+                    return state
         destination = self.resolve_remote(requested, write=True, overwrite=overwrite)
         chunks = (size + self.config.chunk_size - 1) // self.config.chunk_size if size else 0
         state = self.store.create(
@@ -385,18 +583,45 @@ class ServerApp:
                 "chunks_consumed": 0,
                 "producer_complete": False,
                 "ready_chunks": {},
+                "compression": compression,
+                "decoded_size": decoded_size if compression == "gzip" else None,
+                "decoded_sha256": None,
+                "metadata_ready": True,
+                "resumable": resumable,
             }
         )
         if pipeline:
             self.start_worker(self._receive_upload_pipeline, str(state["id"]))
+        state["resumed"] = False
         return state
 
     def create_download(self, body: Mapping[str, Any]) -> Dict[str, Any]:
         requested = body.get("path")
+        compression = body.get("compression")
+        resumable = body.get("resume", False)
+        resume_id = body.get("resume_id")
         pipeline = "inflight" in body
         inflight = body.get("inflight")
         if not isinstance(requested, str):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
+        if not isinstance(resumable, bool):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "resume must be a boolean")
+        if resume_id is not None and (
+            not resumable
+            or not isinstance(resume_id, str)
+            or not TRANSFER_ID.fullmatch(resume_id)
+        ):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resume_id must be a transfer id and requires resume",
+            )
+        if resumable and pipeline:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resumable downloads cannot use the bounded pipeline",
+            )
         if pipeline and (
             isinstance(inflight, bool)
             or not isinstance(inflight, int)
@@ -408,21 +633,69 @@ class ServerApp:
                 "invalid_request",
                 "inflight must be an integer between 1 and 128",
             )
+        if compression not in (None, "gzip"):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "compression must be gzip when provided",
+            )
+        if compression == "gzip" and not pipeline:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "compressed downloads require the pipeline protocol",
+            )
+        if resumable and compression is not None:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "resumable downloads cannot use compression",
+            )
         source = self.resolve_remote(requested, write=False)
         stat = source.stat()
         if stat.st_size > self.config.max_file_size:
             raise ApiError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "file_too_large", "file exceeds server max_file_size")
+        wire_size = 0 if compression == "gzip" else stat.st_size
         chunks = (
-            (stat.st_size + self.config.chunk_size - 1) // self.config.chunk_size
-            if stat.st_size
+            (wire_size + self.config.chunk_size - 1) // self.config.chunk_size
+            if wire_size
             else 0
         )
+        if resume_id is not None:
+            try:
+                previous = self.store.get(resume_id)
+            except ApiError as exc:
+                if exc.code != "not_found":
+                    raise
+                previous = None
+            if previous is not None:
+                matches = (
+                    previous.get("direction") == "download"
+                    and previous.get("resumable") is True
+                    and previous.get("pipeline") is not True
+                    and previous.get("compression") is None
+                    and previous.get("path") == str(source)
+                    and previous.get("size") == wire_size
+                    and previous.get("mtime_ns") == stat.st_mtime_ns
+                    and previous.get("source_dev") == stat.st_dev
+                    and previous.get("source_ino") == stat.st_ino
+                )
+                if not matches:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "resume_mismatch",
+                        "saved download does not match the current NAS source",
+                    )
+                if previous.get("status") in ("preparing", "ready"):
+                    state = self.store.update(resume_id)
+                    state["resumed"] = True
+                    return state
         state = self.store.create(
             {
                 "direction": "download",
                 "status": "preparing",
                 "path": str(source),
-                "size": stat.st_size,
+                "size": wire_size,
                 "mtime_ns": stat.st_mtime_ns,
                 "source_dev": stat.st_dev,
                 "source_ino": stat.st_ino,
@@ -438,13 +711,23 @@ class ServerApp:
                 "chunks_consumed": 0,
                 "producer_complete": False,
                 "ready_chunks": {},
+                "compression": compression,
+                "decoded_size": stat.st_size if compression == "gzip" else None,
+                "decoded_sha256": None,
+                "metadata_ready": compression is None,
+                "resumable": resumable,
             }
         )
         self.start_worker(self._prepare_download, str(state["id"]))
+        state["resumed"] = False
         return state
 
     def urls(self, transfer_id: str, start: int, count: int) -> Dict[str, Any]:
         state = self.store.get(transfer_id)
+        if state.get("resumable") is True:
+            # URL requests are the resumable protocol's heartbeat. Without this,
+            # a long but healthy copy could be removed by the TTL janitor.
+            state = self.store.update(transfer_id)
         direction = state.get("direction")
         pipeline = state.get("pipeline") is True
         if direction == "upload":
@@ -511,8 +794,26 @@ class ServerApp:
         if current.get("pipeline") is True:
             with self._pipeline_condition:
                 current = self.store.get(transfer_id)
+                decoded_digest = body.get("decoded_sha256")
+                if current.get("compression") == "gzip":
+                    if not isinstance(decoded_digest, str) or not SHA256.fullmatch(
+                        decoded_digest
+                    ):
+                        raise ApiError(
+                            HTTPStatus.BAD_REQUEST,
+                            "invalid_request",
+                            "decoded_sha256 must be lowercase hexadecimal",
+                        )
+                elif decoded_digest is not None:
+                    raise ApiError(
+                        HTTPStatus.BAD_REQUEST,
+                        "invalid_request",
+                        "decoded_sha256 requires gzip compression",
+                    )
                 if current.get("status") == "complete" or current.get("producer_complete"):
-                    if current.get("sha256") != digest:
+                    if current.get("sha256") != digest or current.get(
+                        "decoded_sha256"
+                    ) != decoded_digest:
                         raise ApiError(
                             HTTPStatus.CONFLICT,
                             "invalid_state",
@@ -534,6 +835,7 @@ class ServerApp:
                 state = self.store.update(
                     transfer_id,
                     sha256=digest,
+                    decoded_sha256=decoded_digest,
                     producer_complete=True,
                     error=None,
                 )
@@ -749,6 +1051,19 @@ class ServerApp:
         except OSError as exc:
             LOG.warning("could not remove partial NAS file for %s: %s", state["id"], exc)
 
+    def _download_compressed_path(self, state: Mapping[str, Any]) -> Path:
+        return self.config.state_dir / "compressed" / ("%s.gz" % state["id"])
+
+    def _remove_download_temporary(self, state: Mapping[str, Any]) -> None:
+        if state.get("direction") != "download":
+            return
+        try:
+            self._download_compressed_path(state).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            LOG.warning("could not remove compressed NAS file for %s: %s", state["id"], exc)
+
     def _revalidate_upload_destination(self, destination: Path) -> None:
         current = destination.resolve(strict=False)
         if current != destination or not any(
@@ -830,9 +1145,14 @@ class ServerApp:
                 | getattr(os, "O_BINARY", 0),
                 0o600,
             )
-            digest = hashlib.sha256()
             transferred = 0
             with os.fdopen(fd, "wb") as handle:
+                decoded_size = (
+                    int(state["decoded_size"])
+                    if state.get("compression") == "gzip"
+                    else int(state["size"])
+                )
+                sink = DecodingWriter(handle, state.get("compression"), decoded_size)
                 try:
                     os.chmod(str(temporary), 0o600)
                 except OSError:
@@ -862,8 +1182,7 @@ class ServerApp:
                     data = self._get_chunk_bytes(transfer_id, index, expected)
                     if hashlib.sha256(data).hexdigest() != chunk_digest:
                         raise Nass3cpError("chunk %d SHA-256 mismatch" % index)
-                    handle.write(data)
-                    digest.update(data)
+                    sink.write(data)
                     self._retry(
                         lambda current=index: self.s3.delete_chunk(transfer_id, current),
                         "delete chunk %d" % index,
@@ -889,6 +1208,7 @@ class ServerApp:
                         )
                         self._pipeline_condition.notify_all()
 
+                wire_digest, decoded_digest = sink.finish()
                 with self._pipeline_condition:
                     while True:
                         current = self.store.get(transfer_id)
@@ -904,8 +1224,13 @@ class ServerApp:
                 handle.flush()
                 os.fsync(handle.fileno())
 
-            if digest.hexdigest() != current.get("sha256"):
+            if wire_digest != current.get("sha256"):
                 raise Nass3cpError("end-to-end SHA-256 mismatch")
+            if (
+                state.get("compression") == "gzip"
+                and decoded_digest != current.get("decoded_sha256")
+            ):
+                raise Nass3cpError("decoded end-to-end SHA-256 mismatch")
             with self._pipeline_condition:
                 current = self.store.get(transfer_id)
                 if current.get("status") != "receiving":
@@ -944,6 +1269,9 @@ class ServerApp:
 
     def _prepare_download(self, transfer_id: str) -> None:
         state = self.store.get(transfer_id)
+        if state.get("compression") == "gzip":
+            self._prepare_download_compressed(transfer_id)
+            return
         if state.get("pipeline") is True:
             self._prepare_download_pipeline(transfer_id)
             return
@@ -953,7 +1281,12 @@ class ServerApp:
             transferred = 0
             with source.open("rb") as handle:
                 before = os.fstat(handle.fileno())
-                if before.st_dev != state["source_dev"] or before.st_ino != state["source_ino"]:
+                if (
+                    before.st_dev != state["source_dev"]
+                    or before.st_ino != state["source_ino"]
+                    or before.st_size != state["size"]
+                    or before.st_mtime_ns != state["mtime_ns"]
+                ):
                     raise Nass3cpError("source file was replaced before it could be read")
                 for index in range(int(state["chunks"])):
                     data = handle.read(int(state["chunk_size"]))
@@ -985,15 +1318,133 @@ class ServerApp:
             cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
             self.store.update(transfer_id, objects_cleaned=cleaned)
 
-    def _prepare_download_pipeline(self, transfer_id: str) -> None:
+    def _prepare_download_compressed(self, transfer_id: str) -> None:
         state = self.store.get(transfer_id)
         source = Path(str(state["path"]))
+        compressed = self._download_compressed_path(state)
+        try:
+            compressed.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(str(compressed.parent), 0o700)
+            except OSError:
+                pass
+            fd = os.open(
+                str(compressed),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            last_reported = 0
+
+            def report(processed: int) -> None:
+                nonlocal last_reported
+                if processed - last_reported < int(state["chunk_size"]):
+                    return
+                current = self.store.get(transfer_id)
+                if current.get("status") != "preparing":
+                    raise Nass3cpError(str(current.get("error") or "download was cancelled"))
+                self.store.update(transfer_id, bytes_transferred=processed)
+                last_reported = processed
+
+            with os.fdopen(fd, "wb") as output, source.open("rb") as source_handle:
+                before = os.fstat(source_handle.fileno())
+                if (
+                    before.st_dev != state["source_dev"]
+                    or before.st_ino != state["source_ino"]
+                    or before.st_size != state["decoded_size"]
+                    or before.st_mtime_ns != state["mtime_ns"]
+                ):
+                    raise Nass3cpError("source file was replaced before compression")
+                decoded_digest, decoded_size = gzip_compress_stream(
+                    source_handle,
+                    output,
+                    report,
+                )
+                output.flush()
+                os.fsync(output.fileno())
+                after = os.fstat(source_handle.fileno())
+                if (
+                    after.st_size != before.st_size
+                    or after.st_mtime_ns != before.st_mtime_ns
+                    or decoded_size != int(state["decoded_size"])
+                ):
+                    raise Nass3cpError("source file changed during compression")
+
+            compressed_size = compressed.stat().st_size
+            if compressed_size >= decoded_size:
+                self._remove_download_temporary(state)
+                wire_size = decoded_size
+                compression = None
+                decoded_state_size = None
+                decoded_state_digest = None
+                pipeline_source = source
+                verify_identity = True
+            else:
+                wire_size = compressed_size
+                compression = "gzip"
+                decoded_state_size = decoded_size
+                decoded_state_digest = decoded_digest
+                pipeline_source = compressed
+                verify_identity = False
+            chunks = (
+                (wire_size + int(state["chunk_size"]) - 1) // int(state["chunk_size"])
+                if wire_size
+                else 0
+            )
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                if current.get("status") != "preparing":
+                    raise Nass3cpError(str(current.get("error") or "download was cancelled"))
+                self.store.update(
+                    transfer_id,
+                    size=wire_size,
+                    chunks=chunks,
+                    bytes_transferred=0,
+                    compression=compression,
+                    decoded_size=decoded_state_size,
+                    decoded_sha256=decoded_state_digest,
+                    metadata_ready=True,
+                    objects_cleaned=chunks == 0,
+                )
+                self._pipeline_condition.notify_all()
+            self._prepare_download_pipeline(
+                transfer_id,
+                source=pipeline_source,
+                verify_identity=verify_identity,
+            )
+        except Exception as exc:
+            LOG.error("download compression %s failed: %s", transfer_id, exc)
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                message = str(current.get("error") or exc)
+                self.store.update(transfer_id, status="error", error=message)
+                self._pipeline_condition.notify_all()
+            cleaned = self._cleanup_state_objects(self.store.get(transfer_id))
+            self.store.update(transfer_id, objects_cleaned=cleaned)
+        finally:
+            self._remove_download_temporary(state)
+
+    def _prepare_download_pipeline(
+        self,
+        transfer_id: str,
+        source: Optional[Path] = None,
+        verify_identity: bool = True,
+    ) -> None:
+        state = self.store.get(transfer_id)
+        pipeline_source = source if source is not None else Path(str(state["path"]))
         try:
             digest = hashlib.sha256()
             transferred = 0
-            with source.open("rb") as handle:
+            with pipeline_source.open("rb") as handle:
                 before = os.fstat(handle.fileno())
-                if before.st_dev != state["source_dev"] or before.st_ino != state["source_ino"]:
+                if verify_identity and (
+                    before.st_dev != state["source_dev"]
+                    or before.st_ino != state["source_ino"]
+                    or before.st_size != state["size"]
+                    or before.st_mtime_ns != state["mtime_ns"]
+                ):
                     raise Nass3cpError("source file was replaced before it could be read")
                 for index in range(int(state["chunks"])):
                     with self._pipeline_condition:
@@ -1131,10 +1582,13 @@ class ServerApp:
 
     def cleanup_interrupted(self) -> None:
         for state in self.store.all():
-            if state.get("status") not in ("complete", "error") or state.get("objects_cleaned"):
+            if state.get("status") not in ("complete", "error"):
                 continue
             transfer_id = str(state["id"])
             self._remove_upload_temporary(state)
+            self._remove_download_temporary(state)
+            if state.get("objects_cleaned"):
+                continue
             cleaned = self._cleanup_state_objects(state)
             self.store.update(transfer_id, objects_cleaned=cleaned)
 
@@ -1149,6 +1603,7 @@ class ServerApp:
                 if status in ("preparing", "receiving", "cleaning"):
                     continue
                 self._remove_upload_temporary(state)
+                self._remove_download_temporary(state)
                 if not state.get("objects_cleaned"):
                     self._cleanup_state_objects(state)
                 self.store.remove(transfer_id)
@@ -1259,6 +1714,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             body = self._body()
             if path == "/v1/list":
                 self._send_json(HTTPStatus.OK, self.app.list_directory(body))
+                return
+            if path == "/v1/path-info":
+                self._send_json(HTTPStatus.OK, self.app.path_info(body))
+                return
+            if path == "/v1/directories":
+                result = self.app.ensure_directory(body)
+                self._send_json(
+                    HTTPStatus.CREATED if result["created"] else HTTPStatus.OK,
+                    result,
+                )
                 return
             if path == "/v1/transfers/upload":
                 state = self.app.create_upload(body)

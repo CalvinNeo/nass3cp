@@ -10,6 +10,7 @@ from . import __version__
 from .client import ApiClient, download, list_remote, upload
 from .credentials import CredentialStore, credential_target
 from .errors import AuthenticationError, Nass3cpError
+from .recursive import recursive_download_directory, recursive_upload_directory
 
 
 def _remote(value: Optional[str]) -> Optional[str]:
@@ -88,7 +89,7 @@ def _has_explicit_password(args: argparse.Namespace) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nass3cp",
-        description="Copy one file through S3, or list a NAS directory",
+        description="Copy files or directory trees through S3, or list a NAS directory",
     )
     parser.add_argument("--host", required=True, help="NAS service hostname or IP")
     parser.add_argument("--port", type=int, default=9443, help="NAS service port (default: 9443)")
@@ -124,6 +125,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="use HTTP over an already-encrypted overlay network or tunnel",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing destination file")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="retain and resume completed blocks for a single-file copy",
+    )
+    parser.add_argument(
+        "-r",
+        "--recursive",
+        action="store_true",
+        help="recursively merge a source directory into the destination directory",
+    )
+    parser.add_argument(
+        "--rpolicy",
+        choices=("auto", "raw"),
+        default="auto",
+        help="recursive transfer policy: compress suitable files or copy raw (default: auto)",
+    )
+    parser.add_argument(
+        "--dry",
+        action="store_true",
+        help="plan a recursive copy and print statistics without changing files",
+    )
     parser.add_argument("--jobs", type=int, default=2, help="parallel S3 requests (default: 2)")
     parser.add_argument(
         "--inflight",
@@ -172,12 +195,27 @@ def _validate_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[st
     if (source_remote is None) == (destination_remote is None):
         raise Nass3cpError("exactly one of src and dst must start with nas:")
     if source_remote == "" or destination_remote == "":
-        raise Nass3cpError("NAS path after nas: must not be empty")
+        if not args.recursive:
+            raise Nass3cpError("NAS path after nas: must not be empty")
+        if source_remote == "":
+            source_remote = "."
+        if destination_remote == "":
+            destination_remote = "."
+    if args.dry and not args.recursive:
+        raise Nass3cpError("--dry requires --recursive")
+    if args.recursive and args.overwrite:
+        raise Nass3cpError(
+            "--overwrite cannot be combined with --recursive; recursive copies skip existing files"
+        )
+    if args.recursive and args.resume:
+        raise Nass3cpError("--resume supports single-file copies and cannot be combined with --recursive")
     return source_remote, destination_remote
 
 
 def _validate_ls_args(args: argparse.Namespace) -> str:
     _validate_common_args(args)
+    if args.recursive or args.dry or args.resume:
+        raise Nass3cpError("ls cannot be combined with --recursive, --dry, or --resume")
     remote_path = _remote(args.dst)
     if remote_path is None:
         raise Nass3cpError("ls requires one NAS directory prefixed with nas:")
@@ -192,6 +230,10 @@ def _validate_forget_args(args: argparse.Namespace) -> None:
         raise Nass3cpError("--forget-password cannot be combined with --no-saved-password")
     if args.src is not None or args.dst is not None:
         raise Nass3cpError("--forget-password does not accept src or dst")
+    if args.recursive or args.dry or args.resume:
+        raise Nass3cpError(
+            "--forget-password cannot be combined with --recursive, --dry, or --resume"
+        )
 
 
 def _safe_name(value: str) -> str:
@@ -250,7 +292,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             return
 
         list_path: Optional[str] = None
-        if args.src == "ls":
+        if args.src == "ls" and not args.recursive:
             list_path = _validate_ls_args(args)
             source_remote = destination_remote = None
         else:
@@ -302,6 +344,30 @@ def main(argv: Optional[List[str]] = None) -> None:
                         )
         if list_path is not None:
             _print_directory(list_remote(api, list_path))
+        elif args.recursive and source_remote is None:
+            recursive_upload_directory(
+                api,
+                str(args.src),
+                str(destination_remote),
+                args.rpolicy,
+                args.dry,
+                args.jobs,
+                args.inflight,
+                args.transfer_timeout,
+                args.quiet,
+            )
+        elif args.recursive:
+            recursive_download_directory(
+                api,
+                str(source_remote),
+                str(args.dst),
+                args.rpolicy,
+                args.dry,
+                args.jobs,
+                args.inflight,
+                args.transfer_timeout,
+                args.quiet,
+            )
         elif source_remote is None:
             upload(
                 api,
@@ -312,6 +378,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.transfer_timeout,
                 args.quiet,
                 args.inflight,
+                resume=args.resume,
             )
         else:
             download(
@@ -323,6 +390,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.transfer_timeout,
                 args.quiet,
                 args.inflight,
+                resume=args.resume,
             )
     except KeyboardInterrupt:
         print("nass3cp: cancelled", file=sys.stderr)

@@ -52,6 +52,90 @@ class CliTests(unittest.TestCase):
         _validate_args(args)
         self.assertEqual(args.inflight, 3)
 
+    def test_recursive_policy_defaults_to_auto(self):
+        args = build_parser().parse_args(
+            ["--host", "nas.example", "-r", "source", "nas:destination"]
+        )
+        _validate_args(args)
+        self.assertTrue(args.recursive)
+        self.assertEqual(args.rpolicy, "auto")
+        self.assertFalse(args.dry)
+
+    def test_recursive_copy_maps_nas_root_to_first_allowed_root(self):
+        args = build_parser().parse_args(
+            ["--host", "nas.example", "-r", "source", "nas:"]
+        )
+        source_remote, destination_remote = _validate_args(args)
+        self.assertIsNone(source_remote)
+        self.assertEqual(destination_remote, ".")
+
+    def test_dry_requires_recursive_copy(self):
+        args = build_parser().parse_args(
+            ["--host", "nas.example", "--dry", "source", "nas:destination"]
+        )
+        with self.assertRaises(Nass3cpError) as caught:
+            _validate_args(args)
+        self.assertIn("--recursive", str(caught.exception))
+
+    def test_recursive_copy_rejects_overwrite(self):
+        args = build_parser().parse_args(
+            [
+                "--host",
+                "nas.example",
+                "--recursive",
+                "--overwrite",
+                "source",
+                "nas:destination",
+            ]
+        )
+        with self.assertRaises(Nass3cpError) as caught:
+            _validate_args(args)
+        self.assertIn("skip existing", str(caught.exception))
+
+    def test_resume_is_limited_to_single_file_copies(self):
+        args = build_parser().parse_args(
+            [
+                "--host",
+                "nas.example",
+                "--recursive",
+                "--resume",
+                "source",
+                "nas:destination",
+            ]
+        )
+        with self.assertRaises(Nass3cpError) as caught:
+            _validate_args(args)
+        self.assertIn("single-file", str(caught.exception))
+
+    def test_resume_flag_is_routed_to_single_file_upload(self):
+        api = Mock()
+        with patch("nass3cp.cli.ApiClient", return_value=api), patch(
+            "nass3cp.cli.upload"
+        ) as upload:
+            main(
+                [
+                    "--host",
+                    "nas.example",
+                    "--token",
+                    "password",
+                    "--resume",
+                    "source.bin",
+                    "nas:destination.bin",
+                ]
+            )
+
+        upload.assert_called_once_with(
+            api,
+            "source.bin",
+            "destination.bin",
+            False,
+            2,
+            24 * 3600,
+            False,
+            3,
+            resume=True,
+        )
+
     def test_inflight_must_be_in_supported_range(self):
         args = build_parser().parse_args(
             [
@@ -92,6 +176,66 @@ class CliTests(unittest.TestCase):
         self.assertIn("folder/", output.getvalue())
         self.assertIn("bad\\x1bname", output.getvalue())
         self.assertNotIn("bad\x1bname", output.getvalue())
+
+    def test_recursive_dry_upload_is_routed_with_selected_policy(self):
+        api = Mock()
+        with patch("nass3cp.cli.ApiClient", return_value=api), patch(
+            "nass3cp.cli.recursive_upload_directory"
+        ) as recursive:
+            main(
+                [
+                    "--host",
+                    "nas.example",
+                    "--token",
+                    "password",
+                    "-r",
+                    "--rpolicy=raw",
+                    "--dry",
+                    "source",
+                    "nas:destination",
+                ]
+            )
+
+        recursive.assert_called_once_with(
+            api,
+            "source",
+            "destination",
+            "raw",
+            True,
+            2,
+            3,
+            24 * 3600,
+            False,
+        )
+
+    def test_recursive_download_is_routed(self):
+        api = Mock()
+        with patch("nass3cp.cli.ApiClient", return_value=api), patch(
+            "nass3cp.cli.recursive_download_directory"
+        ) as recursive:
+            main(
+                [
+                    "--host",
+                    "nas.example",
+                    "--token",
+                    "password",
+                    "--recursive",
+                    "nas:source",
+                    "destination",
+                ]
+            )
+
+        recursive.assert_called_once_with(
+            api,
+            "source",
+            "destination",
+            "auto",
+            False,
+            2,
+            3,
+            24 * 3600,
+            False,
+        )
 
     def test_remember_password_validates_before_saving(self):
         store = Mock()

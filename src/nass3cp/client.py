@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import stat
 import ssl
 import sys
 import tempfile
@@ -14,12 +15,15 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 
+from .compression import DecodingWriter
 from .errors import AuthenticationError, Nass3cpError, ProtocolError
 from .net import secure_opener
 
 
 _DATA_OPENERS = threading.local()
 _PROGRESS_REPORT_BYTES = 256 * 1024
+_RESUME_VERSION = 1
+_RESUME_FILE_LIMIT = 16 * 1024 * 1024
 
 
 def _human_bytes(value: float) -> str:
@@ -296,6 +300,10 @@ class ApiClient:
         mtime_ns: int,
         overwrite: bool,
         inflight: Optional[int] = None,
+        compression: Optional[str] = None,
+        decoded_size: Optional[int] = None,
+        resume: bool = False,
+        resume_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "path": path,
@@ -305,6 +313,13 @@ class ApiClient:
         }
         if inflight is not None:
             body["inflight"] = inflight
+        if compression is not None:
+            body["compression"] = compression
+            body["decoded_size"] = decoded_size
+        if resume:
+            body["resume"] = True
+            if resume_id is not None:
+                body["resume_id"] = resume_id
         return self.request(
             "POST",
             "/v1/transfers/upload",
@@ -316,10 +331,23 @@ class ApiClient:
         if value.get("status") != "ok":
             raise ProtocolError("server returned an invalid health response")
 
-    def create_download(self, path: str, inflight: Optional[int] = None) -> Dict[str, Any]:
+    def create_download(
+        self,
+        path: str,
+        inflight: Optional[int] = None,
+        compression: Optional[str] = None,
+        resume: bool = False,
+        resume_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         body: Dict[str, Any] = {"path": path}
         if inflight is not None:
             body["inflight"] = inflight
+        if compression is not None:
+            body["compression"] = compression
+        if resume:
+            body["resume"] = True
+            if resume_id is not None:
+                body["resume_id"] = resume_id
         return self.request("POST", "/v1/transfers/download", body)
 
     def list_directory(self, path: str, cursor: int = 0, limit: int = 500) -> Dict[str, Any]:
@@ -328,6 +356,34 @@ class ApiClient:
             "/v1/list",
             {"path": path, "cursor": cursor, "limit": limit},
         )
+
+    def path_info(self, path: str) -> Dict[str, Any]:
+        value = self.request("POST", "/v1/path-info", {"path": path})
+        exists = value.get("exists")
+        if not isinstance(exists, bool):
+            raise ProtocolError("server returned invalid NAS path information")
+        if not exists:
+            return {"exists": False}
+        kind = value.get("type")
+        size = value.get("size")
+        mtime_ns = value.get("mtime_ns")
+        if kind not in ("directory", "file", "other"):
+            raise ProtocolError("server returned invalid NAS path type")
+        if kind == "file":
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ProtocolError("server returned invalid NAS path size")
+        elif size is not None:
+            raise ProtocolError("server returned invalid NAS path size")
+        if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int):
+            raise ProtocolError("server returned invalid NAS path timestamp")
+        return {"exists": True, "type": kind, "size": size, "mtime_ns": mtime_ns}
+
+    def ensure_directory(self, path: str) -> bool:
+        value = self.request("POST", "/v1/directories", {"path": path})
+        created = value.get("created")
+        if not isinstance(created, bool):
+            raise ProtocolError("server returned an invalid directory creation response")
+        return created
 
     def state(self, transfer_id: str) -> Dict[str, Any]:
         return self.request("GET", "/v1/transfers/%s" % transfer_id)
@@ -341,8 +397,16 @@ class ApiClient:
             raise ProtocolError("server URL response has no items array")
         return items
 
-    def commit(self, transfer_id: str, digest: str) -> Dict[str, Any]:
-        return self.request("POST", "/v1/transfers/%s/commit" % transfer_id, {"sha256": digest})
+    def commit(
+        self,
+        transfer_id: str,
+        digest: str,
+        decoded_digest: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body = {"sha256": digest}
+        if decoded_digest is not None:
+            body["decoded_sha256"] = decoded_digest
+        return self.request("POST", "/v1/transfers/%s/commit" % transfer_id, body)
 
     def chunk_ready(self, transfer_id: str, index: int, digest: str) -> Dict[str, Any]:
         return self.request(
@@ -516,6 +580,164 @@ def _data_request(
     raise ProtocolError("S3 %s failed after %d attempts: %s" % (method, attempts, last_error))
 
 
+def _resume_path(target: Path, direction: str) -> Path:
+    return target.parent / (".%s.nass3cp-%s.json" % (target.name, direction))
+
+
+def _resume_server(api: ApiClient) -> str:
+    value = getattr(api, "base_url", "")
+    return value if isinstance(value, str) else ""
+
+
+def _valid_digest(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _load_resume(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        size = path.stat().st_size
+        if size > _RESUME_FILE_LIMIT:
+            raise ValueError("resume file is too large")
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise Nass3cpError(
+            "cannot read resume state %s; remove it to restart: %s" % (path, exc)
+        ) from exc
+    if not isinstance(value, dict) or value.get("version") != _RESUME_VERSION:
+        raise Nass3cpError(
+            "resume state %s is invalid; remove it to restart" % path
+        )
+    transfer_id = value.get("transfer_id")
+    if (
+        not isinstance(transfer_id, str)
+        or len(transfer_id) != 32
+        or any(character not in "0123456789abcdef" for character in transfer_id)
+    ):
+        raise Nass3cpError(
+            "resume state %s has an invalid transfer id; remove it to restart" % path
+        )
+    return value
+
+
+def _save_resume(path: Path, value: Mapping[str, Any]) -> None:
+    fd, temporary = tempfile.mkstemp(
+        prefix=".nass3cp-resume-",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temporary, str(path))
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.01 * (2 ** attempt))
+        try:
+            os.chmod(str(path), 0o600)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _remove_resume(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _resume_completed(value: Mapping[str, Any], chunks: int) -> Dict[int, str]:
+    raw = value.get("completed")
+    if not isinstance(raw, dict):
+        raise Nass3cpError("resume state has no valid completed-block map")
+    result: Dict[int, str] = {}
+    for key, digest in raw.items():
+        if (
+            not isinstance(key, str)
+            or not key.isdigit()
+            or str(int(key)) != key
+            or int(key) < 0
+            or int(key) >= chunks
+            or not _valid_digest(digest)
+        ):
+            raise Nass3cpError("resume state contains an invalid completed block")
+        result[int(key)] = digest
+    return result
+
+
+def _set_resume_completed(value: Dict[str, Any], completed: Mapping[int, str]) -> None:
+    value["completed"] = {
+        str(index): completed[index] for index in sorted(completed)
+    }
+
+
+def _chunk_length(size: int, chunk_size: int, index: int) -> int:
+    return min(chunk_size, max(0, size - index * chunk_size))
+
+
+def _completed_bytes(completed: Mapping[int, str], size: int, chunk_size: int) -> int:
+    return sum(_chunk_length(size, chunk_size, index) for index in completed)
+
+
+def _file_digest(path: Path, expected_size: int) -> Optional[str]:
+    try:
+        details = path.stat()
+        if not path.is_file() or details.st_size != expected_size:
+            return None
+        digest = hashlib.sha256()
+        remaining = expected_size
+        with path.open("rb") as handle:
+            while remaining:
+                data = handle.read(min(1024 * 1024, remaining))
+                if not data:
+                    return None
+                digest.update(data)
+                remaining -= len(data)
+            if handle.read(1):
+                return None
+        after = path.stat()
+        if after.st_size != details.st_size or after.st_mtime_ns != details.st_mtime_ns:
+            return None
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _require_resume_fields(
+    checkpoint: Mapping[str, Any],
+    path: Path,
+    expected: Mapping[str, Any],
+) -> None:
+    mismatched = [name for name, value in expected.items() if checkpoint.get(name) != value]
+    if mismatched:
+        raise Nass3cpError(
+            "resume state %s does not match this copy (%s); remove it to restart"
+            % (path, ", ".join(sorted(mismatched)))
+        )
+
+
 def _verify_state(state: Mapping[str, Any], direction: str) -> Tuple[str, int, int, int]:
     transfer_id = state.get("id")
     size = state.get("size")
@@ -651,6 +873,264 @@ def _wait_for_pipeline_chunk(
         delay = min(1.0, delay * 1.4)
 
 
+def _wait_for_download_metadata(
+    api: ApiClient,
+    transfer_id: str,
+    timeout: int,
+    progress: "_ProgressDisplay",
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    delay = 0.2
+    while True:
+        state = api.state(transfer_id)
+        status = state.get("status")
+        if status == "error":
+            raise ProtocolError(
+                "transfer failed on NAS: %s" % state.get("error", "unknown error")
+            )
+        if status not in ("preparing", "ready"):
+            raise ProtocolError("server returned unexpected compression state: %r" % status)
+        decoded_size = state.get("decoded_size", 0)
+        processed = state.get("bytes_transferred", 0)
+        if isinstance(decoded_size, int) and isinstance(processed, int):
+            progress.update("compress on NAS", processed, decoded_size)
+        if state.get("metadata_ready") is True:
+            return state
+        if time.monotonic() >= deadline:
+            raise ProtocolError("timed out waiting for NAS compression")
+        time.sleep(delay)
+        delay = min(1.0, delay * 1.4)
+
+
+def _source_identity(details: os.stat_result) -> Tuple[int, int, int, int]:
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+    )
+
+
+def _resumable_upload(
+    api: ApiClient,
+    source: Path,
+    before: os.stat_result,
+    remote_destination: str,
+    overwrite: bool,
+    jobs: int,
+    transfer_timeout: int,
+    quiet: bool,
+    requested_mtime_ns: int,
+) -> None:
+    checkpoint_path = _resume_path(source, "upload")
+    checkpoint = _load_resume(checkpoint_path)
+    expected_checkpoint = {
+        "version": _RESUME_VERSION,
+        "direction": "upload",
+        "server": _resume_server(api),
+        "local_path": str(source.resolve()),
+        "remote_path": remote_destination,
+        "size": before.st_size,
+        "mtime_ns": before.st_mtime_ns,
+        "destination_mtime_ns": requested_mtime_ns,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "overwrite": overwrite,
+    }
+    if checkpoint is not None:
+        _require_resume_fields(checkpoint, checkpoint_path, expected_checkpoint)
+        resume_id = str(checkpoint["transfer_id"])
+    else:
+        resume_id = None
+
+    state = api.create_upload(
+        remote_destination,
+        before.st_size,
+        requested_mtime_ns,
+        overwrite,
+        resume=True,
+        resume_id=resume_id,
+    )
+    transfer_id, size, chunks, chunk_size = _verify_state(state, "upload")
+    if state.get("resumable") is not True or state.get("pipeline") is True:
+        api.abort(transfer_id)
+        raise ProtocolError("NAS server does not support resumable single-file uploads")
+    if size != before.st_size:
+        api.abort(transfer_id)
+        raise ProtocolError("server returned a different upload size")
+
+    resumed = (
+        checkpoint is not None
+        and transfer_id == resume_id
+        and state.get("resumed") is True
+    )
+    status = state.get("status")
+    progress = _ProgressDisplay(not quiet)
+    try:
+        if resumed and status in ("receiving", "complete"):
+            if status != "complete":
+                wait_for_state(
+                    api,
+                    transfer_id,
+                    ("complete",),
+                    transfer_timeout,
+                    quiet,
+                    progress,
+                    "copy from S3 to NAS",
+                )
+            _remove_resume(checkpoint_path)
+            return
+        if status != "awaiting_upload":
+            raise ProtocolError("server returned an invalid resumable upload state")
+
+        if not resumed:
+            checkpoint = dict(expected_checkpoint)
+            checkpoint.update(
+                {
+                    "transfer_id": transfer_id,
+                    "chunk_size": chunk_size,
+                    "chunks": chunks,
+                    "completed": {},
+                }
+            )
+            _save_resume(checkpoint_path, checkpoint)
+        else:
+            assert checkpoint is not None
+            _require_resume_fields(
+                checkpoint,
+                checkpoint_path,
+                {"chunk_size": chunk_size, "chunks": chunks},
+            )
+
+        assert checkpoint is not None
+        completed = _resume_completed(checkpoint, chunks)
+        digest = hashlib.sha256()
+        validated: Dict[int, str] = {}
+        expected_identity = _source_identity(before)
+        with source.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if _source_identity(opened) != expected_identity:
+                raise Nass3cpError("local source was replaced before it could be read")
+            for index in range(chunks):
+                expected = _chunk_length(size, chunk_size, index)
+                data = handle.read(expected)
+                if len(data) != expected:
+                    raise Nass3cpError("local source became shorter during transfer")
+                digest.update(data)
+                chunk_digest = hashlib.sha256(data).hexdigest()
+                if completed.get(index) == chunk_digest:
+                    validated[index] = chunk_digest
+            if handle.read(1):
+                raise Nass3cpError("local source grew during transfer")
+            after = os.fstat(handle.fileno())
+            if _source_identity(after) != expected_identity:
+                raise Nass3cpError("local source changed during transfer")
+
+        if validated != completed:
+            completed = validated
+            _set_resume_completed(checkpoint, completed)
+            _save_resume(checkpoint_path, checkpoint)
+        completed_size = _completed_bytes(completed, size, chunk_size)
+        progress.update("upload to S3", completed_size, size, force=True)
+        if resumed and not quiet:
+            print(
+                "resuming upload: %d/%d blocks already complete"
+                % (len(completed), chunks),
+                file=sys.stderr,
+            )
+
+        missing = [index for index in range(chunks) if index not in completed]
+        with source.open("rb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
+            opened = os.fstat(handle.fileno())
+            if _source_identity(opened) != expected_identity:
+                raise Nass3cpError("local source was replaced before it could be uploaded")
+            for group_start in range(0, len(missing), jobs):
+                indexes = missing[group_start : group_start + jobs]
+                payloads: List[bytes] = []
+                items: List[Dict[str, Any]] = []
+                for index in indexes:
+                    handle.seek(index * chunk_size)
+                    expected = _chunk_length(size, chunk_size, index)
+                    data = handle.read(expected)
+                    if len(data) != expected:
+                        raise Nass3cpError("local source became shorter during transfer")
+                    urls = api.urls(transfer_id, index, 1)
+                    if len(urls) != 1 or urls[0].get("index") != index:
+                        raise ProtocolError("server returned the wrong resumable upload URL")
+                    payloads.append(data)
+                    items.append(urls[0])
+
+                batch_progress = _BatchProgress(
+                    progress,
+                    "upload to S3",
+                    completed_size,
+                    size,
+                    [len(payload) for payload in payloads],
+                )
+                futures = [
+                    executor.submit(
+                        _data_request,
+                        "PUT",
+                        item,
+                        payload,
+                        progress=None if quiet else batch_progress.callback(offset),
+                    )
+                    for offset, (item, payload) in enumerate(zip(items, payloads))
+                ]
+                first_error: Optional[BaseException] = None
+                pending = {
+                    future: (index, payload)
+                    for index, payload, future in zip(indexes, payloads, futures)
+                }
+                while pending:
+                    finished, _ = wait(
+                        tuple(pending),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    changed = False
+                    for future in sorted(finished, key=lambda item: pending[item][0]):
+                        index, payload = pending.pop(future)
+                        try:
+                            future.result()
+                        except BaseException as exc:
+                            if first_error is None:
+                                first_error = exc
+                        else:
+                            completed[index] = hashlib.sha256(payload).hexdigest()
+                            completed_size += len(payload)
+                            changed = True
+                    if changed:
+                        _set_resume_completed(checkpoint, completed)
+                        _save_resume(checkpoint_path, checkpoint)
+                progress.update(
+                    "upload to S3",
+                    completed_size,
+                    size,
+                    force=completed_size == size,
+                )
+                if first_error is not None:
+                    raise first_error
+            after = os.fstat(handle.fileno())
+            if _source_identity(after) != expected_identity:
+                raise Nass3cpError("local source changed during transfer")
+
+        api.commit(transfer_id, digest.hexdigest())
+        wait_for_state(
+            api,
+            transfer_id,
+            ("complete",),
+            transfer_timeout,
+            quiet,
+            progress,
+            "copy from S3 to NAS",
+        )
+        _remove_resume(checkpoint_path)
+    finally:
+        # Resumable failures intentionally retain both the local block map and
+        # the server-side transfer. The NAS janitor removes stale state at TTL.
+        progress.close()
+
+
 def upload(
     api: ApiClient,
     local_source: str,
@@ -660,19 +1140,71 @@ def upload(
     transfer_timeout: int,
     quiet: bool,
     inflight: int = 3,
+    compression: Optional[str] = None,
+    decoded_size: Optional[int] = None,
+    decoded_digest: Optional[str] = None,
+    destination_mtime_ns: Optional[int] = None,
+    source_identity: Optional[Tuple[int, int, int, int]] = None,
+    resume: bool = False,
 ) -> None:
     source = Path(local_source)
     if not source.is_file():
         raise Nass3cpError("local source is not a regular file: %s" % source)
     before = source.stat()
-    state = api.create_upload(
-        remote_destination,
-        before.st_size,
-        before.st_mtime_ns,
-        overwrite,
-        inflight,
+    if source_identity is not None:
+        lexical = source.lstat()
+        actual_identity = (
+            lexical.st_dev,
+            lexical.st_ino,
+            lexical.st_size,
+            lexical.st_mtime_ns,
+        )
+        if not stat.S_ISREG(lexical.st_mode) or actual_identity != source_identity:
+            raise Nass3cpError(
+                "local source changed after recursive planning: %s" % source
+            )
+    requested_mtime_ns = (
+        before.st_mtime_ns if destination_mtime_ns is None else destination_mtime_ns
     )
+    if resume:
+        if compression is not None:
+            raise ValueError("resumable single-file uploads cannot use compression")
+        _resumable_upload(
+            api,
+            source,
+            before,
+            remote_destination,
+            overwrite,
+            jobs,
+            transfer_timeout,
+            quiet,
+            requested_mtime_ns,
+        )
+        return
+    if compression is not None:
+        if compression != "gzip" or decoded_size is None or decoded_digest is None:
+            raise ValueError("compressed upload requires decoded size and SHA-256")
+        state = api.create_upload(
+            remote_destination,
+            before.st_size,
+            requested_mtime_ns,
+            overwrite,
+            inflight,
+            compression,
+            decoded_size,
+        )
+    else:
+        state = api.create_upload(
+            remote_destination,
+            before.st_size,
+            requested_mtime_ns,
+            overwrite,
+            inflight,
+        )
     transfer_id, size, chunks, chunk_size = _verify_state(state, "upload")
+    if compression is not None and state.get("compression") != compression:
+        api.abort(transfer_id)
+        raise ProtocolError("NAS server does not support compressed uploads")
     pipeline = state.get("pipeline") is True
     if pipeline:
         returned_inflight = state.get("inflight")
@@ -810,7 +1342,10 @@ def upload(
             ):
                 raise Nass3cpError("local source changed during transfer")
         committed = True
-        api.commit(transfer_id, digest.hexdigest())
+        if decoded_digest is None:
+            api.commit(transfer_id, digest.hexdigest())
+        else:
+            api.commit(transfer_id, digest.hexdigest(), decoded_digest)
         wait_for_state(
             api,
             transfer_id,
@@ -838,6 +1373,327 @@ def _local_destination(remote_source: str, value: str) -> Path:
     return destination
 
 
+def _resume_partial_path(destination: Path, checkpoint: Mapping[str, Any]) -> Path:
+    name = checkpoint.get("partial_name")
+    prefix = ".%s." % destination.name
+    if (
+        not isinstance(name, str)
+        or not name.startswith(prefix)
+        or not name.endswith(".nass3cp-part")
+        or Path(name).name != name
+    ):
+        raise Nass3cpError("download resume state contains an invalid partial-file name")
+    return destination.parent / name
+
+
+def _remove_partial(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _resumable_download(
+    api: ApiClient,
+    remote_source: str,
+    destination: Path,
+    overwrite: bool,
+    jobs: int,
+    transfer_timeout: int,
+    quiet: bool,
+) -> None:
+    checkpoint_path = _resume_path(destination, "download")
+    checkpoint = _load_resume(checkpoint_path)
+    expected_checkpoint = {
+        "version": _RESUME_VERSION,
+        "direction": "download",
+        "server": _resume_server(api),
+        "remote_path": remote_source,
+        "destination_path": str(destination.resolve()),
+        "overwrite": overwrite,
+    }
+    old_partial: Optional[Path] = None
+    if checkpoint is not None:
+        _require_resume_fields(checkpoint, checkpoint_path, expected_checkpoint)
+        old_partial = _resume_partial_path(destination, checkpoint)
+        resume_id = str(checkpoint["transfer_id"])
+    else:
+        resume_id = None
+
+    initial = api.create_download(
+        remote_source,
+        resume=True,
+        resume_id=resume_id,
+    )
+    transfer_id, size, chunks, chunk_size = _verify_state(initial, "download")
+    if initial.get("resumable") is not True or initial.get("pipeline") is True:
+        api.abort(transfer_id)
+        raise ProtocolError("NAS server does not support resumable single-file downloads")
+    if initial.get("compression") is not None:
+        api.abort(transfer_id)
+        raise ProtocolError("server enabled compression for a resumable download")
+    mtime_ns = initial.get("mtime_ns")
+    if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int) or mtime_ns < 0:
+        api.abort(transfer_id)
+        raise ProtocolError("server returned an invalid download timestamp")
+
+    resumed = (
+        checkpoint is not None
+        and transfer_id == resume_id
+        and initial.get("resumed") is True
+    )
+    partial: Optional[Path] = None
+    progress = _ProgressDisplay(not quiet)
+    try:
+        if not resumed:
+            fd, temporary = tempfile.mkstemp(
+                prefix=".%s." % destination.name,
+                suffix=".nass3cp-part",
+                dir=str(destination.parent),
+            )
+            partial = Path(temporary)
+            try:
+                try:
+                    os.chmod(temporary, 0o600)
+                except OSError:
+                    pass
+                with os.fdopen(fd, "w+b") as handle:
+                    handle.truncate(size)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                checkpoint = dict(expected_checkpoint)
+                checkpoint.update(
+                    {
+                        "transfer_id": transfer_id,
+                        "size": size,
+                        "mtime_ns": mtime_ns,
+                        "chunk_size": chunk_size,
+                        "chunks": chunks,
+                        "partial_name": partial.name,
+                        "completed": {},
+                    }
+                )
+                _save_resume(checkpoint_path, checkpoint)
+            except Exception:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                _remove_partial(partial)
+                raise
+            if old_partial is not None and old_partial != partial:
+                _remove_partial(old_partial)
+        else:
+            assert checkpoint is not None
+            _require_resume_fields(
+                checkpoint,
+                checkpoint_path,
+                {
+                    "size": size,
+                    "mtime_ns": mtime_ns,
+                    "chunk_size": chunk_size,
+                    "chunks": chunks,
+                },
+            )
+            partial = _resume_partial_path(destination, checkpoint)
+
+        assert checkpoint is not None
+        assert partial is not None
+        if initial.get("status") == "ready":
+            state = initial
+        else:
+            state = wait_for_state(
+                api,
+                transfer_id,
+                ("ready",),
+                transfer_timeout,
+                quiet,
+                progress,
+                "copy from NAS to S3",
+            )
+        if state.get("resumable") is not True:
+            raise ProtocolError("server changed resumable download mode")
+        returned_id, returned_size, returned_chunks, returned_chunk_size = _verify_state(
+            state, "download"
+        )
+        if (
+            returned_id != transfer_id
+            or returned_size != size
+            or returned_chunks != chunks
+            or returned_chunk_size != chunk_size
+        ):
+            raise ProtocolError("server changed resumable download metadata")
+        remote_digest = state.get("sha256")
+        if not _valid_digest(remote_digest):
+            raise ProtocolError("server returned an invalid SHA-256 digest")
+
+        if destination.exists() and (not overwrite or not partial.exists()):
+            if _file_digest(destination, size) == remote_digest:
+                _remove_partial(partial)
+                partial = None
+                _remove_resume(checkpoint_path)
+                progress.close()
+                try:
+                    api.acknowledge(transfer_id)
+                except Nass3cpError as exc:
+                    if not quiet:
+                        print(
+                            "warning: file is complete but NAS cleanup acknowledgement failed: %s"
+                            % exc,
+                            file=sys.stderr,
+                        )
+                return
+            if not overwrite:
+                raise Nass3cpError(
+                    "local destination appeared during transfer; refusing to overwrite it"
+                )
+
+        try:
+            partial_details = partial.lstat()
+        except FileNotFoundError as exc:
+            raise Nass3cpError(
+                "partial file for %s is missing; remove %s to restart"
+                % (destination, checkpoint_path)
+            ) from exc
+        if not stat.S_ISREG(partial_details.st_mode) or partial_details.st_size != size:
+            raise Nass3cpError(
+                "partial file for %s is invalid; remove it and %s to restart"
+                % (destination, checkpoint_path)
+            )
+
+        completed = _resume_completed(checkpoint, chunks)
+        validated: Dict[int, str] = {}
+        with partial.open("r+b") as handle:
+            for index in sorted(completed):
+                expected = _chunk_length(size, chunk_size, index)
+                handle.seek(index * chunk_size)
+                data = handle.read(expected)
+                if len(data) == expected and hashlib.sha256(data).hexdigest() == completed[index]:
+                    validated[index] = completed[index]
+            if validated != completed:
+                completed = validated
+                _set_resume_completed(checkpoint, completed)
+                _save_resume(checkpoint_path, checkpoint)
+
+            completed_size = _completed_bytes(completed, size, chunk_size)
+            progress.update("download from S3", completed_size, size, force=True)
+            if resumed and not quiet:
+                print(
+                    "resuming download: %d/%d blocks already complete"
+                    % (len(completed), chunks),
+                    file=sys.stderr,
+                )
+
+            missing = [index for index in range(chunks) if index not in completed]
+            with ThreadPoolExecutor(max_workers=jobs) as executor:
+                for group_start in range(0, len(missing), jobs):
+                    indexes = missing[group_start : group_start + jobs]
+                    items: List[Dict[str, Any]] = []
+                    sizes: List[int] = []
+                    for index in indexes:
+                        urls = api.urls(transfer_id, index, 1)
+                        if len(urls) != 1 or urls[0].get("index") != index:
+                            raise ProtocolError(
+                                "server returned the wrong resumable download URL"
+                            )
+                        items.append(urls[0])
+                        sizes.append(_chunk_length(size, chunk_size, index))
+                    batch_progress = _BatchProgress(
+                        progress,
+                        "download from S3",
+                        completed_size,
+                        size,
+                        sizes,
+                    )
+                    futures = [
+                        executor.submit(
+                            _data_request,
+                            "GET",
+                            item,
+                            None,
+                            expected,
+                            progress=None if quiet else batch_progress.callback(offset),
+                        )
+                        for offset, (item, expected) in enumerate(zip(items, sizes))
+                    ]
+                    first_error: Optional[BaseException] = None
+                    pending = {
+                        future: index for index, future in zip(indexes, futures)
+                    }
+                    while pending:
+                        finished, _ = wait(
+                            tuple(pending),
+                            return_when=FIRST_COMPLETED,
+                        )
+                        successful: List[Tuple[int, bytes, str]] = []
+                        for future in sorted(finished, key=lambda item: pending[item]):
+                            index = pending.pop(future)
+                            try:
+                                data = future.result()
+                            except BaseException as exc:
+                                if first_error is None:
+                                    first_error = exc
+                            else:
+                                successful.append(
+                                    (index, data, hashlib.sha256(data).hexdigest())
+                                )
+                        for index, data, _digest in successful:
+                            handle.seek(index * chunk_size)
+                            handle.write(data)
+                        if successful:
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                            for index, data, chunk_digest in successful:
+                                completed[index] = chunk_digest
+                                completed_size += len(data)
+                            _set_resume_completed(checkpoint, completed)
+                            _save_resume(checkpoint_path, checkpoint)
+                    progress.update(
+                        "download from S3",
+                        completed_size,
+                        size,
+                        force=completed_size == size,
+                    )
+                    if first_error is not None:
+                        raise first_error
+
+            handle.seek(0)
+            digest = hashlib.sha256()
+            remaining = size
+            while remaining:
+                data = handle.read(min(1024 * 1024, remaining))
+                if not data:
+                    raise Nass3cpError("resumable partial file is truncated")
+                digest.update(data)
+                remaining -= len(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if len(completed) != chunks or digest.hexdigest() != remote_digest:
+            raise Nass3cpError("end-to-end SHA-256 mismatch")
+        if destination.exists() and not overwrite:
+            raise Nass3cpError(
+                "local destination appeared during transfer; refusing to overwrite it"
+            )
+        os.utime(str(partial), ns=(mtime_ns, mtime_ns))
+        os.replace(str(partial), str(destination))
+        partial = None
+        _remove_resume(checkpoint_path)
+        progress.close()
+        try:
+            api.acknowledge(transfer_id)
+        except Nass3cpError as exc:
+            if not quiet:
+                print(
+                    "warning: file is complete but NAS cleanup acknowledgement failed: %s" % exc,
+                    file=sys.stderr,
+                )
+    finally:
+        # Do not abort or remove the partial file on failure: both are needed by
+        # the next invocation to request only the missing blocks.
+        progress.close()
+
+
 def download(
     api: ApiClient,
     remote_source: str,
@@ -847,6 +1703,8 @@ def download(
     transfer_timeout: int,
     quiet: bool,
     inflight: int = 3,
+    compression: Optional[str] = None,
+    resume: bool = False,
 ) -> None:
     destination = _local_destination(remote_source, local_destination)
     if not destination.parent.is_dir():
@@ -854,11 +1712,57 @@ def download(
     if destination.exists():
         if destination.is_dir():
             raise Nass3cpError("local destination is a directory: %s" % destination)
-        if not overwrite:
+        if not overwrite and not (
+            resume and _resume_path(destination, "download").exists()
+        ):
             raise Nass3cpError("local destination exists; use --overwrite: %s" % destination)
 
-    initial = api.create_download(remote_source, inflight)
+    if resume:
+        if compression is not None:
+            raise ValueError("resumable single-file downloads cannot use compression")
+        _resumable_download(
+            api,
+            remote_source,
+            destination,
+            overwrite,
+            jobs,
+            transfer_timeout,
+            quiet,
+        )
+        return
+
+    progress = _ProgressDisplay(not quiet)
+    if compression is None:
+        initial = api.create_download(remote_source, inflight)
+    else:
+        if compression != "gzip":
+            raise ValueError("unsupported download compression")
+        initial = api.create_download(remote_source, inflight, compression)
+    initial_transfer_id = initial.get("id")
+    if not isinstance(initial_transfer_id, str) or len(initial_transfer_id) != 32:
+        raise ProtocolError("server returned an invalid transfer id")
+    if initial.get("compression") == "gzip" and initial.get("metadata_ready") is not True:
+        try:
+            initial = _wait_for_download_metadata(
+                api,
+                initial_transfer_id,
+                transfer_timeout,
+                progress,
+            )
+        except (Exception, KeyboardInterrupt):
+            api.abort(initial_transfer_id)
+            progress.close()
+            raise
     transfer_id, size, chunks, chunk_size = _verify_state(initial, "download")
+    wire_compression = initial.get("compression")
+    if wire_compression not in (None, "gzip"):
+        raise ProtocolError("server returned unsupported download compression")
+    if wire_compression == "gzip":
+        decoded_size = initial.get("decoded_size")
+        if isinstance(decoded_size, bool) or not isinstance(decoded_size, int) or decoded_size < 0:
+            raise ProtocolError("server returned invalid decoded file size")
+    else:
+        decoded_size = size
     pipeline = initial.get("pipeline") is True
     if pipeline:
         returned_inflight = initial.get("inflight")
@@ -867,7 +1771,6 @@ def download(
         _pipeline_counts(initial, chunks)
     ready = pipeline
     temporary: Optional[str] = None
-    progress = _ProgressDisplay(not quiet)
     try:
         if pipeline:
             state = initial
@@ -887,81 +1790,127 @@ def download(
             suffix=".nass3cp-part",
             dir=str(destination.parent),
         )
-        digest = hashlib.sha256()
         transferred = 0
         progress_label = "copy from NAS via S3" if pipeline else "download from S3"
         progress.update(progress_label, 0, size, force=True)
         with os.fdopen(fd, "wb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
-            start = 0
-            while start < chunks:
-                if pipeline:
+            sink = DecodingWriter(handle, wire_compression, decoded_size)
+            next_request = 0
+            next_write = 0
+            active: Dict[Any, Tuple[int, Optional[str]]] = {}
+            buffered: Dict[int, Tuple[bytes, str]] = {}
+            download_progress = _PipelineProgress(progress, progress_label, size)
+            if pipeline:
+                staged, consumed = _pipeline_counts(state, chunks)
+                if consumed != 0:
+                    raise ProtocolError("server returned an unexpected consumed chunk index")
+            else:
+                staged = chunks
+
+            while next_write < chunks:
+                # Keep both network workers and buffered out-of-order results bounded
+                # by --jobs. As the NAS stages new chunks, free worker slots are
+                # filled without waiting for the current batch to finish.
+                available = staged - next_request
+                capacity = jobs - len(active) - len(buffered)
+                launch = min(max(0, available), max(0, capacity), chunks - next_request)
+                if launch:
+                    items = api.urls(transfer_id, next_request, launch)
+                    if len(items) != launch:
+                        raise ProtocolError("server returned the wrong number of download URLs")
+                    for offset, item in enumerate(items):
+                        index = next_request + offset
+                        if item.get("index") != index:
+                            raise ProtocolError("server returned out-of-order download URLs")
+                        expected = min(chunk_size, size - index * chunk_size)
+                        expected_digest = item.get("sha256") if pipeline else None
+                        if pipeline and (
+                            not isinstance(expected_digest, str)
+                            or len(expected_digest) != 64
+                            or any(
+                                character not in "0123456789abcdef"
+                                for character in expected_digest
+                            )
+                        ):
+                            raise ProtocolError(
+                                "server returned an invalid chunk SHA-256 digest"
+                            )
+                        download_progress.register(index, expected)
+                        future = executor.submit(
+                            _data_request,
+                            "GET",
+                            item,
+                            None,
+                            expected,
+                            progress=None
+                            if quiet
+                            else download_progress.callback(index),
+                        )
+                        active[future] = (index, expected_digest)
+                    next_request += launch
+
+                completed = set()
+                if active:
+                    completed, _ = wait(
+                        tuple(active),
+                        timeout=0.25,
+                        return_when=FIRST_COMPLETED,
+                    )
+                if completed:
+                    for future in sorted(completed, key=lambda item: active[item][0]):
+                        index, expected_digest = active.pop(future)
+                        data = future.result()
+                        chunk_digest = hashlib.sha256(data).hexdigest()
+                        if pipeline and chunk_digest != expected_digest:
+                            raise Nass3cpError("chunk %d SHA-256 mismatch" % index)
+                        buffered[index] = (data, chunk_digest)
+                        download_progress.finish(index)
+
+                    while next_write in buffered:
+                        data, chunk_digest = buffered.pop(next_write)
+                        sink.write(data)
+                        transferred += len(data)
+                        if pipeline:
+                            updated = api.acknowledge_chunk(
+                                transfer_id,
+                                next_write,
+                                chunk_digest,
+                            )
+                            _check_pipeline_state(updated, ("preparing", "ready"))
+                            staged, consumed = _pipeline_counts(updated, chunks)
+                            if consumed != next_write + 1:
+                                raise ProtocolError(
+                                    "server did not acknowledge the downloaded chunk"
+                                )
+                        next_write += 1
+                    continue
+
+                if active:
+                    if pipeline:
+                        state = api.state(transfer_id)
+                        _check_pipeline_state(state, ("preparing", "ready"))
+                        staged, consumed = _pipeline_counts(state, chunks)
+                        if consumed != next_write:
+                            raise ProtocolError(
+                                "server returned an unexpected consumed chunk index"
+                            )
+                    continue
+
+                if pipeline and next_request < chunks:
+                    if next_request != next_write or buffered:
+                        raise ProtocolError("download scheduler lost a pending chunk")
                     state = _wait_for_pipeline_chunk(
                         api,
                         transfer_id,
                         chunks,
-                        start,
+                        next_request,
                         transfer_timeout,
                     )
                     staged, _ = _pipeline_counts(state, chunks)
-                    count = min(jobs, staged - start, chunks - start)
-                else:
-                    count = min(jobs, chunks - start)
-                items = api.urls(transfer_id, start, count)
-                if len(items) != count:
-                    raise ProtocolError("server returned the wrong number of download URLs")
-                request_specs = []
-                for offset, item in enumerate(items):
-                    index = start + offset
-                    if item.get("index") != index:
-                        raise ProtocolError("server returned out-of-order download URLs")
-                    expected = min(chunk_size, size - index * chunk_size)
-                    expected_digest = item.get("sha256") if pipeline else None
-                    if pipeline and (
-                        not isinstance(expected_digest, str)
-                        or len(expected_digest) != 64
-                        or any(character not in "0123456789abcdef" for character in expected_digest)
-                    ):
-                        raise ProtocolError("server returned an invalid chunk SHA-256 digest")
-                    request_specs.append((item, expected, expected_digest))
-                batch_progress = _BatchProgress(
-                    progress,
-                    progress_label,
-                    transferred,
-                    size,
-                    [expected for _, expected, _ in request_specs],
-                )
-                futures = [
-                    executor.submit(
-                        _data_request,
-                        "GET",
-                        item,
-                        None,
-                        expected,
-                        progress=None if quiet else batch_progress.callback(offset),
-                    )
-                    for offset, (item, expected, _) in enumerate(request_specs)
-                ]
-                for offset, future in enumerate(futures):
-                    data = future.result()
-                    chunk_digest = hashlib.sha256(data).hexdigest()
-                    expected_digest = request_specs[offset][2]
-                    if pipeline and chunk_digest != expected_digest:
-                        raise Nass3cpError("chunk %d SHA-256 mismatch" % (start + offset))
-                    handle.write(data)
-                    digest.update(data)
-                    transferred += len(data)
-                    if pipeline:
-                        updated = api.acknowledge_chunk(
-                            transfer_id,
-                            start + offset,
-                            chunk_digest,
-                        )
-                        _check_pipeline_state(updated, ("preparing", "ready"))
-                        _, consumed = _pipeline_counts(updated, chunks)
-                        if consumed != start + offset + 1:
-                            raise ProtocolError("server did not acknowledge the downloaded chunk")
-                start += count
-                progress.update(progress_label, transferred, size, force=transferred == size)
+                    continue
+
+                raise ProtocolError("download scheduler stopped before all chunks completed")
+            wire_digest, decoded_digest = sink.finish()
             handle.flush()
             os.fsync(handle.fileno())
         if pipeline:
@@ -979,8 +1928,18 @@ def download(
             or any(character not in "0123456789abcdef" for character in remote_digest)
         ):
             raise ProtocolError("server returned an invalid SHA-256 digest")
-        if transferred != size or digest.hexdigest() != remote_digest:
+        if transferred != size or wire_digest != remote_digest:
             raise Nass3cpError("end-to-end SHA-256 mismatch")
+        if state.get("compression") != wire_compression:
+            raise ProtocolError("server changed download compression during transfer")
+        if wire_compression == "gzip":
+            remote_decoded_digest = state.get("decoded_sha256")
+            if (
+                not isinstance(remote_decoded_digest, str)
+                or len(remote_decoded_digest) != 64
+                or decoded_digest != remote_decoded_digest
+            ):
+                raise Nass3cpError("decoded end-to-end SHA-256 mismatch")
         if destination.exists() and not overwrite:
             raise Nass3cpError("local destination appeared during transfer; refusing to overwrite it")
         mtime_ns = state.get("mtime_ns")
