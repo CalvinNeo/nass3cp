@@ -8,7 +8,8 @@ from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from . import __version__
 from .client import ApiClient, download, list_remote, upload
-from .errors import Nass3cpError
+from .credentials import CredentialStore, credential_target
+from .errors import AuthenticationError, Nass3cpError
 
 
 def _remote(value: Optional[str]) -> Optional[str]:
@@ -34,29 +35,54 @@ def _base_url(host: str, port: int, tls: bool = True) -> str:
     return "%s://%s:%d" % ("https" if tls else "http", host, port)
 
 
-def _password(args: argparse.Namespace) -> str:
+def _password_choice(
+    args: argparse.Namespace,
+    saved_password: Optional[str] = None,
+) -> Tuple[str, str]:
     password_file = args.password_file or args.token_file
     if args.token is not None:
         value = args.token
+        source = "argument"
     elif password_file is not None:
         try:
             value = Path(password_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise Nass3cpError("cannot read password file: %s" % exc) from exc
+        source = "file"
     else:
         value = os.environ.get("NASS3CP_PASSWORD") or os.environ.get("NASS3CP_TOKEN", "")
-        if not value:
+        if value:
+            source = "environment"
+        elif saved_password is not None:
+            value = saved_password
+            source = "saved"
+        else:
             try:
                 value = getpass.getpass("NAS password: ")
             except EOFError as exc:
                 raise Nass3cpError(
                     "cannot read a password; use an interactive terminal or --password-file"
                 ) from exc
+            source = "prompt"
     if not value:
         raise Nass3cpError("password must not be empty")
     if "\r" in value or "\n" in value:
         raise Nass3cpError("password must be a single line")
-    return value
+    return value, source
+
+
+def _password(args: argparse.Namespace, saved_password: Optional[str] = None) -> str:
+    return _password_choice(args, saved_password)[0]
+
+
+def _has_explicit_password(args: argparse.Namespace) -> bool:
+    return bool(
+        args.token is not None
+        or args.password_file
+        or args.token_file
+        or os.environ.get("NASS3CP_PASSWORD")
+        or os.environ.get("NASS3CP_TOKEN")
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -70,6 +96,21 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--token", help=argparse.SUPPRESS)
     auth.add_argument("--token-file", help=argparse.SUPPRESS)
     auth.add_argument("--password-file", help="read the NAS password from this file instead of prompting")
+    parser.add_argument(
+        "--remember-password",
+        action="store_true",
+        help="verify and save the password in the operating system credential store",
+    )
+    parser.add_argument(
+        "--no-saved-password",
+        action="store_true",
+        help="ignore a password previously saved for this NAS endpoint",
+    )
+    parser.add_argument(
+        "--forget-password",
+        action="store_true",
+        help="remove the saved password for this NAS endpoint and exit",
+    )
     tls = parser.add_mutually_exclusive_group()
     tls.add_argument("--ca-file", help="CA certificate used to verify the NAS service")
     tls.add_argument(
@@ -98,7 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--quiet", action="store_true", help="do not print progress")
     parser.add_argument("--version", action="version", version=__version__)
-    parser.add_argument("src", help="source path, or the ls command; prefix NAS paths with nas:")
+    parser.add_argument(
+        "src",
+        nargs="?",
+        help="source path, or the ls command; prefix NAS paths with nas:",
+    )
     parser.add_argument(
         "dst",
         nargs="?",
@@ -120,7 +165,7 @@ def _validate_common_args(args: argparse.Namespace) -> None:
 
 def _validate_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
     _validate_common_args(args)
-    if args.dst is None:
+    if args.src is None or args.dst is None:
         raise Nass3cpError("copy requires both src and dst")
     source_remote = _remote(args.src)
     destination_remote = _remote(args.dst)
@@ -137,6 +182,16 @@ def _validate_ls_args(args: argparse.Namespace) -> str:
     if remote_path is None:
         raise Nass3cpError("ls requires one NAS directory prefixed with nas:")
     return remote_path or "."
+
+
+def _validate_forget_args(args: argparse.Namespace) -> None:
+    _validate_common_args(args)
+    if args.remember_password:
+        raise Nass3cpError("--forget-password cannot be combined with --remember-password")
+    if args.no_saved_password:
+        raise Nass3cpError("--forget-password cannot be combined with --no-saved-password")
+    if args.src is not None or args.dst is not None:
+        raise Nass3cpError("--forget-password does not accept src or dst")
 
 
 def _safe_name(value: str) -> str:
@@ -181,6 +236,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        _validate_common_args(args)
+        base_url = _base_url(args.host, args.port, tls=not args.no_tls)
+        password_target = credential_target(base_url, insecure=args.insecure)
+        credential_store = CredentialStore()
+        if args.forget_password:
+            _validate_forget_args(args)
+            removed = credential_store.delete(password_target)
+            if removed:
+                print("removed saved password for %s" % password_target)
+            else:
+                print("no saved password for %s" % password_target)
+            return
+
         list_path: Optional[str] = None
         if args.src == "ls":
             list_path = _validate_ls_args(args)
@@ -194,18 +262,50 @@ def main(argv: Optional[List[str]] = None) -> None:
                 "warning: NAS control traffic relies on the overlay/tunnel for encryption",
                 file=sys.stderr,
             )
+        saved_password = None
+        if not args.no_saved_password and not _has_explicit_password(args):
+            saved_password = credential_store.load(password_target)
+        password, password_source = _password_choice(args, saved_password)
         api = ApiClient(
-            _base_url(args.host, args.port, tls=not args.no_tls),
-            _password(args),
+            base_url,
+            password,
             ca_file=args.ca_file,
             insecure=args.insecure,
         )
+        if password_source == "saved" or args.remember_password:
+            try:
+                api.check_authenticated()
+            except AuthenticationError:
+                if password_source != "saved":
+                    raise
+                print(
+                    "warning: saved NAS password was rejected; enter the current password",
+                    file=sys.stderr,
+                )
+                password, _ = _password_choice(args, None)
+                api = ApiClient(
+                    base_url,
+                    password,
+                    ca_file=args.ca_file,
+                    insecure=args.insecure,
+                )
+                api.check_authenticated()
+                credential_store.save(password_target, password)
+            else:
+                if args.remember_password:
+                    credential_store.save(password_target, password)
+                    if not args.quiet:
+                        print(
+                            "password saved in %s for %s"
+                            % (credential_store.description, password_target),
+                            file=sys.stderr,
+                        )
         if list_path is not None:
             _print_directory(list_remote(api, list_path))
         elif source_remote is None:
             upload(
                 api,
-                args.src,
+                str(args.src),
                 str(destination_remote),
                 args.overwrite,
                 args.jobs,

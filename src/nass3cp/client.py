@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request
 
-from .errors import Nass3cpError, ProtocolError
+from .errors import AuthenticationError, Nass3cpError, ProtocolError
 from .net import secure_opener
 
 
@@ -280,6 +280,8 @@ class ApiClient:
                 message = value["error"]["message"]
             except Exception:
                 message = "HTTP %d" % exc.code
+            if exc.code == 401:
+                raise AuthenticationError("NAS password was rejected") from exc
             raise ProtocolError("server request failed: %s" % message) from exc
         except (URLError, OSError) as exc:
             reason = exc.reason if isinstance(exc, URLError) else exc
@@ -308,6 +310,11 @@ class ApiClient:
             "/v1/transfers/upload",
             body,
         )
+
+    def check_authenticated(self) -> None:
+        value = self.request("GET", "/v1/health")
+        if value.get("status") != "ok":
+            raise ProtocolError("server returned an invalid health response")
 
     def create_download(self, path: str, inflight: Optional[int] = None) -> Dict[str, Any]:
         body: Dict[str, Any] = {"path": path}

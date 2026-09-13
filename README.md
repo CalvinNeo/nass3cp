@@ -13,6 +13,7 @@ NAS  ──HTTPS──► R2/S3 ──HTTPS──► 本机    # 从 NAS 下载
 ## 安全模型
 
 - NAS API 使用密码认证。客户端默认在终端安全提示输入密码，不需要把密码保存在客户端配置或命令行历史中。
+- Windows 客户端可在验证密码成功后，将其保存到当前登录用户的 Windows 凭据管理器；程序不保存解密密钥，也不会把明文密码写入项目目录。
 - 控制通道可选择应用层 TLS 1.2+，或在 ZeroTier/OpenTier、已启用加密的 FRP 等可信隧道内使用 HTTP。后者必须显式传 `--no-tls`。
 - 内网 IP 本身不提供加密；使用无 TLS 模式时，保密性和完整性完全由覆盖网络或隧道承担。密码会作为每个控制请求的 Bearer 凭证发送，因此绝不能在未加密网络上使用该模式。
 - S3 Endpoint 和客户端拿到的预签名 URL 始终必须是 HTTPS；无 TLS 模式不会降低文件数据通道的要求。
@@ -156,7 +157,32 @@ NAS password:
 
 输出依次显示类型（`d` 目录、`-` 普通文件、`l` 符号链接）、文件字节数、修改时间和名称。目录名以 `/` 结尾，符号链接以 `@` 结尾。`ls nas:` 可列出 `allowed_roots` 第一项的根目录；列表不递归，大目录由客户端自动分页获取。
 
-这里的 `10.10.10.2` 要换成 NAS 的 ZeroTier/OpenTier IP；如果使用 FRP，则换成加密隧道提供的本地入口地址。密码输入不会回显。自动化脚本可以用 `--password-file`，或在项目内创建 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
+这里的 `10.10.10.2` 要换成 NAS 的 ZeroTier/OpenTier IP；如果使用 FRP，则换成加密隧道提供的本地入口地址。密码输入不会回显。
+
+### 在 Windows 中记住密码
+
+第一次连接时增加 `--remember-password`。客户端会先向 NAS 验证密码，只有认证成功才写入当前用户的 Windows 凭据管理器：
+
+```powershell
+.\bin\nass3cp.cmd --no-tls --host 10.10.10.2 --remember-password ls nas:
+```
+
+以后对相同主机、端口和连接安全模式执行复制或 `ls` 时会自动读取，不再提示输入。显式传入的 `--password-file`、`NASS3CP_PASSWORD` 或兼容的旧参数优先级更高。
+
+密码改变时，可以忽略旧值并验证、覆盖保存新密码：
+
+```powershell
+.\bin\nass3cp.cmd --no-tls --host 10.10.10.2 `
+  --no-saved-password --remember-password ls nas:
+```
+
+删除保存的密码（安全模式参数应与保存时一致）：
+
+```powershell
+.\bin\nass3cp.cmd --no-tls --host 10.10.10.2 --forget-password
+```
+
+验证过的 HTTPS、`--insecure` HTTPS 和 `--no-tls` 会使用彼此独立的凭据项，防止较弱连接自动复用较强连接下保存的密码。Windows 凭据保护可以防止其他系统用户直接读取，但不能防御已经以当前 Windows 用户身份运行的恶意程序。非 Windows 平台或没有交互式用户凭据会话的定时任务仍应使用 `--password-file`，或在项目内创建 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
 
 TLS 模式仍然可用：
 

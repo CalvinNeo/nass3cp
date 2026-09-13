@@ -10,6 +10,9 @@ class ProtocolError(Nass3cpError):
     """The peer returned an invalid response."""
 
 
+class AuthenticationError(ProtocolError):
+    """The NAS rejected the supplied password."""
+
+
 class S3Error(Nass3cpError):
     """An S3-compatible endpoint request failed."""
-

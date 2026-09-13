@@ -13,6 +13,7 @@ from unittest import mock
 from nass3cp.config import S3Config, ServerConfig
 from nass3cp import client
 from nass3cp.client import ApiClient
+from nass3cp.errors import AuthenticationError
 from nass3cp.s3 import PresignedRequest
 from nass3cp.server import (
     ApiError,
@@ -493,9 +494,27 @@ class ServerTransferTests(unittest.TestCase):
             )
             health = api.request("GET", "/v1/health")
             self.assertEqual(health["status"], "ok")
+            api.check_authenticated()
             listing = api.list_directory(".", 0, 1)
             self.assertEqual(listing["entries"][0]["name"], "listed.bin")
             self.assertIsNone(listing["next_cursor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_api_client_reports_a_rejected_password_distinctly(self):
+        server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            api = ApiClient(
+                "http://127.0.0.1:%d" % server.server_port,
+                "wrong-password",
+                timeout=5,
+            )
+            with self.assertRaises(AuthenticationError):
+                api.check_authenticated()
         finally:
             server.shutdown()
             server.server_close()

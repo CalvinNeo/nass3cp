@@ -166,7 +166,7 @@ kill "$(cat run/nass3cp.pid)"
 NAS password:
 ```
 
-将 `10.10.10.2` 换成 NAS 的覆盖网络 IP。无人值守场景可使用 `--password-file`，或复制 `config/client.env.example` 为 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
+将 `10.10.10.2` 换成 NAS 的覆盖网络 IP。Windows 交互式客户端可在首次成功认证时加上 `--remember-password`，将密码保存到当前用户的 Windows 凭据管理器；以后相同端点和安全模式会自动读取。无人值守场景可使用 `--password-file`，或复制 `config/client.env.example` 为 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
 
 Windows PowerShell 使用 `.cmd` 启动器，它会自动寻找 Python 3.8+：
 
