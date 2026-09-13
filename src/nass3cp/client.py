@@ -6,7 +6,7 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from http.client import HTTPException
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
@@ -163,6 +163,40 @@ class _BatchProgress:
         return report
 
 
+class _PipelineProgress:
+    def __init__(self, display: _ProgressDisplay, label: str, total: int):
+        self.display = display
+        self.label = label
+        self.total = total
+        self.completed = 0
+        self.current: Dict[int, int] = {}
+        self.sizes: Dict[int, int] = {}
+        self._lock = threading.Lock()
+
+    def register(self, index: int, size: int) -> None:
+        with self._lock:
+            self.current[index] = 0
+            self.sizes[index] = size
+
+    def callback(self, index: int) -> Callable[[int], None]:
+        def report(value: int) -> None:
+            with self._lock:
+                size = self.sizes[index]
+                self.current[index] = max(0, min(int(value), size))
+                completed = self.completed + sum(self.current.values())
+            self.display.update(self.label, completed, self.total)
+
+        return report
+
+    def finish(self, index: int) -> None:
+        with self._lock:
+            size = self.sizes.pop(index)
+            self.current.pop(index, None)
+            self.completed += size
+            completed = self.completed + sum(self.current.values())
+        self.display.update(self.label, completed, self.total, force=completed == self.total)
+
+
 class _ProgressReader:
     def __init__(self, data: bytes, report: Callable[[int], None]):
         self._data = data
@@ -253,15 +287,40 @@ class ApiClient:
         except (UnicodeDecodeError, ValueError, KeyError) as exc:
             raise ProtocolError("server returned invalid JSON") from exc
 
-    def create_upload(self, path: str, size: int, mtime_ns: int, overwrite: bool) -> Dict[str, Any]:
+    def create_upload(
+        self,
+        path: str,
+        size: int,
+        mtime_ns: int,
+        overwrite: bool,
+        inflight: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {
+            "path": path,
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "overwrite": overwrite,
+        }
+        if inflight is not None:
+            body["inflight"] = inflight
         return self.request(
             "POST",
             "/v1/transfers/upload",
-            {"path": path, "size": size, "mtime_ns": mtime_ns, "overwrite": overwrite},
+            body,
         )
 
-    def create_download(self, path: str) -> Dict[str, Any]:
-        return self.request("POST", "/v1/transfers/download", {"path": path})
+    def create_download(self, path: str, inflight: Optional[int] = None) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"path": path}
+        if inflight is not None:
+            body["inflight"] = inflight
+        return self.request("POST", "/v1/transfers/download", body)
+
+    def list_directory(self, path: str, cursor: int = 0, limit: int = 500) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/list",
+            {"path": path, "cursor": cursor, "limit": limit},
+        )
 
     def state(self, transfer_id: str) -> Dict[str, Any]:
         return self.request("GET", "/v1/transfers/%s" % transfer_id)
@@ -278,6 +337,20 @@ class ApiClient:
     def commit(self, transfer_id: str, digest: str) -> Dict[str, Any]:
         return self.request("POST", "/v1/transfers/%s/commit" % transfer_id, {"sha256": digest})
 
+    def chunk_ready(self, transfer_id: str, index: int, digest: str) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/transfers/%s/chunks/%d/ready" % (transfer_id, index),
+            {"sha256": digest},
+        )
+
+    def acknowledge_chunk(self, transfer_id: str, index: int, digest: str) -> Dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/transfers/%s/chunks/%d/ack" % (transfer_id, index),
+            {"sha256": digest},
+        )
+
     def acknowledge(self, transfer_id: str) -> Dict[str, Any]:
         return self.request("POST", "/v1/transfers/%s/ack" % transfer_id, {})
 
@@ -286,6 +359,51 @@ class ApiClient:
             self.request("POST", "/v1/transfers/%s/abort" % transfer_id, {})
         except Nass3cpError:
             pass
+
+
+def list_remote(api: ApiClient, path: str, page_size: int = 500) -> List[Dict[str, Any]]:
+    if isinstance(page_size, bool) or page_size <= 0 or page_size > 1000:
+        raise ValueError("page_size must be between 1 and 1000")
+    cursor = 0
+    result: List[Dict[str, Any]] = []
+    while True:
+        page = api.list_directory(path, cursor, page_size)
+        raw_entries = page.get("entries")
+        if not isinstance(raw_entries, list):
+            raise ProtocolError("server directory response has no entries array")
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                raise ProtocolError("server returned an invalid directory entry")
+            name = raw_entry.get("name")
+            kind = raw_entry.get("type")
+            size = raw_entry.get("size")
+            mtime_ns = raw_entry.get("mtime_ns")
+            if not isinstance(name, str) or not name or "\x00" in name:
+                raise ProtocolError("server returned an invalid directory entry name")
+            if kind not in ("directory", "file", "symlink", "other"):
+                raise ProtocolError("server returned an invalid directory entry type")
+            if kind == "file":
+                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                    raise ProtocolError("server returned an invalid directory entry size")
+            elif size is not None:
+                raise ProtocolError("server returned an invalid directory entry size")
+            if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int):
+                raise ProtocolError("server returned an invalid directory entry timestamp")
+            result.append(
+                {"name": name, "type": kind, "size": size, "mtime_ns": mtime_ns}
+            )
+
+        next_cursor = page.get("next_cursor")
+        if next_cursor is None:
+            return result
+        if (
+            isinstance(next_cursor, bool)
+            or not isinstance(next_cursor, int)
+            or next_cursor != cursor + len(raw_entries)
+            or next_cursor <= cursor
+        ):
+            raise ProtocolError("server returned an invalid directory cursor")
+        cursor = next_cursor
 
 
 def _data_request(
@@ -456,6 +574,76 @@ def wait_for_state(
         delay = min(1.0, delay * 1.4)
 
 
+def _pipeline_counts(state: Mapping[str, Any], chunks: int) -> Tuple[int, int]:
+    staged = state.get("chunks_staged")
+    consumed = state.get("chunks_consumed")
+    if (
+        isinstance(staged, bool)
+        or not isinstance(staged, int)
+        or isinstance(consumed, bool)
+        or not isinstance(consumed, int)
+        or consumed < 0
+        or staged < consumed
+        or staged > chunks
+    ):
+        raise ProtocolError("server returned invalid pipeline counters")
+    return staged, consumed
+
+
+def _check_pipeline_state(state: Mapping[str, Any], active: Sequence[str]) -> None:
+    status = state.get("status")
+    if status == "error":
+        raise ProtocolError("transfer failed on NAS: %s" % state.get("error", "unknown error"))
+    if status not in active:
+        raise ProtocolError("server returned unexpected pipeline state: %r" % status)
+
+
+def _wait_for_pipeline_capacity(
+    api: ApiClient,
+    transfer_id: str,
+    chunks: int,
+    previous_consumed: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    delay = 0.1
+    while True:
+        state = api.state(transfer_id)
+        _check_pipeline_state(state, ("receiving",))
+        _, consumed = _pipeline_counts(state, chunks)
+        if consumed > previous_consumed:
+            return state
+        if time.monotonic() >= deadline:
+            raise ProtocolError("timed out waiting for NAS to consume an S3 chunk")
+        time.sleep(delay)
+        delay = min(1.0, delay * 1.4)
+
+
+def _wait_for_pipeline_chunk(
+    api: ApiClient,
+    transfer_id: str,
+    chunks: int,
+    index: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    delay = 0.1
+    while True:
+        state = api.state(transfer_id)
+        _check_pipeline_state(state, ("preparing", "ready"))
+        staged, consumed = _pipeline_counts(state, chunks)
+        if consumed != index:
+            raise ProtocolError("server returned an unexpected consumed chunk index")
+        if staged > index:
+            return state
+        if state.get("producer_complete"):
+            raise ProtocolError("NAS finished producing before the next chunk became available")
+        if time.monotonic() >= deadline:
+            raise ProtocolError("timed out waiting for the next NAS chunk")
+        time.sleep(delay)
+        delay = min(1.0, delay * 1.4)
+
+
 def upload(
     api: ApiClient,
     local_source: str,
@@ -464,18 +652,30 @@ def upload(
     jobs: int,
     transfer_timeout: int,
     quiet: bool,
+    inflight: int = 3,
 ) -> None:
     source = Path(local_source)
     if not source.is_file():
         raise Nass3cpError("local source is not a regular file: %s" % source)
     before = source.stat()
-    state = api.create_upload(remote_destination, before.st_size, before.st_mtime_ns, overwrite)
+    state = api.create_upload(
+        remote_destination,
+        before.st_size,
+        before.st_mtime_ns,
+        overwrite,
+        inflight,
+    )
     transfer_id, size, chunks, chunk_size = _verify_state(state, "upload")
+    pipeline = state.get("pipeline") is True
+    if pipeline:
+        returned_inflight = state.get("inflight")
+        if returned_inflight != inflight:
+            raise ProtocolError("server returned a different inflight limit")
+        _pipeline_counts(state, chunks)
     committed = False
     progress = _ProgressDisplay(not quiet)
     try:
         digest = hashlib.sha256()
-        transferred = 0
         progress.update("upload to S3", 0, size, force=True)
         with source.open("rb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
             opened = os.fstat(handle.fileno())
@@ -486,42 +686,112 @@ def upload(
                 or opened.st_mtime_ns != before.st_mtime_ns
             ):
                 raise Nass3cpError("local source was replaced before it could be read")
-            for start in range(0, chunks, jobs):
-                count = min(jobs, chunks - start)
-                items = api.urls(transfer_id, start, count)
-                if len(items) != count:
-                    raise ProtocolError("server returned the wrong number of upload URLs")
-                payloads = []
-                for offset in range(count):
-                    data = handle.read(chunk_size)
-                    if not data:
-                        raise Nass3cpError("local source became shorter during transfer")
-                    expected_index = start + offset
-                    if items[offset].get("index") != expected_index:
-                        raise ProtocolError("server returned out-of-order upload URLs")
-                    digest.update(data)
-                    payloads.append(data)
-                batch_progress = _BatchProgress(
-                    progress,
-                    "upload to S3",
-                    transferred,
-                    size,
-                    [len(payload) for payload in payloads],
-                )
-                futures = [
-                    executor.submit(
-                        _data_request,
-                        "PUT",
-                        item,
-                        payload,
-                        progress=None if quiet else batch_progress.callback(offset),
+            if pipeline:
+                _, consumed = _pipeline_counts(state, chunks)
+                next_index = 0
+                active: Dict[Any, Tuple[int, bytes, str]] = {}
+                pipeline_progress = _PipelineProgress(progress, "upload to S3", size)
+                while next_index < chunks or active:
+                    capacity = inflight - (next_index - consumed)
+                    launch = min(
+                        max(0, capacity),
+                        max(0, jobs - len(active)),
+                        chunks - next_index,
                     )
-                    for offset, (item, payload) in enumerate(zip(items, payloads))
-                ]
-                for future, payload in zip(futures, payloads):
-                    future.result()
-                    transferred += len(payload)
-                progress.update("upload to S3", transferred, size, force=transferred == size)
+                    if launch:
+                        items = api.urls(transfer_id, next_index, launch)
+                        if len(items) != launch:
+                            raise ProtocolError("server returned the wrong number of upload URLs")
+                        for offset, item in enumerate(items):
+                            index = next_index + offset
+                            if item.get("index") != index:
+                                raise ProtocolError("server returned out-of-order upload URLs")
+                            data = handle.read(chunk_size)
+                            if not data:
+                                raise Nass3cpError("local source became shorter during transfer")
+                            digest.update(data)
+                            chunk_digest = hashlib.sha256(data).hexdigest()
+                            pipeline_progress.register(index, len(data))
+                            future = executor.submit(
+                                _data_request,
+                                "PUT",
+                                item,
+                                data,
+                                progress=None
+                                if quiet
+                                else pipeline_progress.callback(index),
+                            )
+                            active[future] = (index, data, chunk_digest)
+                        next_index += launch
+
+                    if active:
+                        completed, _ = wait(
+                            tuple(active),
+                            timeout=0.25,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        if completed:
+                            for future in sorted(completed, key=lambda item: active[item][0]):
+                                index, _data, chunk_digest = active[future]
+                                future.result()
+                                pipeline_progress.finish(index)
+                                updated = api.chunk_ready(transfer_id, index, chunk_digest)
+                                _check_pipeline_state(updated, ("receiving",))
+                                _, consumed = _pipeline_counts(updated, chunks)
+                                del active[future]
+                            continue
+                        updated = api.state(transfer_id)
+                        _check_pipeline_state(updated, ("receiving",))
+                        _, consumed = _pipeline_counts(updated, chunks)
+                        continue
+
+                    if next_index < chunks and next_index - consumed >= inflight:
+                        updated = _wait_for_pipeline_capacity(
+                            api,
+                            transfer_id,
+                            chunks,
+                            consumed,
+                            transfer_timeout,
+                        )
+                        _, consumed = _pipeline_counts(updated, chunks)
+            else:
+                transferred = 0
+                for start in range(0, chunks, jobs):
+                    count = min(jobs, chunks - start)
+                    items = api.urls(transfer_id, start, count)
+                    if len(items) != count:
+                        raise ProtocolError("server returned the wrong number of upload URLs")
+                    payloads = []
+                    for offset in range(count):
+                        data = handle.read(chunk_size)
+                        if not data:
+                            raise Nass3cpError("local source became shorter during transfer")
+                        expected_index = start + offset
+                        if items[offset].get("index") != expected_index:
+                            raise ProtocolError("server returned out-of-order upload URLs")
+                        digest.update(data)
+                        payloads.append(data)
+                    batch_progress = _BatchProgress(
+                        progress,
+                        "upload to S3",
+                        transferred,
+                        size,
+                        [len(payload) for payload in payloads],
+                    )
+                    futures = [
+                        executor.submit(
+                            _data_request,
+                            "PUT",
+                            item,
+                            payload,
+                            progress=None if quiet else batch_progress.callback(offset),
+                        )
+                        for offset, (item, payload) in enumerate(zip(items, payloads))
+                    ]
+                    for future, payload in zip(futures, payloads):
+                        future.result()
+                        transferred += len(payload)
+                    progress.update("upload to S3", transferred, size, force=transferred == size)
             if handle.read(1):
                 raise Nass3cpError("local source grew during transfer")
             after = os.fstat(handle.fileno())
@@ -569,6 +839,7 @@ def download(
     jobs: int,
     transfer_timeout: int,
     quiet: bool,
+    inflight: int = 3,
 ) -> None:
     destination = _local_destination(remote_source, local_destination)
     if not destination.parent.is_dir():
@@ -579,25 +850,31 @@ def download(
         if not overwrite:
             raise Nass3cpError("local destination exists; use --overwrite: %s" % destination)
 
-    initial = api.create_download(remote_source)
+    initial = api.create_download(remote_source, inflight)
     transfer_id, size, chunks, chunk_size = _verify_state(initial, "download")
-    ready = False
+    pipeline = initial.get("pipeline") is True
+    if pipeline:
+        returned_inflight = initial.get("inflight")
+        if returned_inflight != inflight:
+            raise ProtocolError("server returned a different inflight limit")
+        _pipeline_counts(initial, chunks)
+    ready = pipeline
     temporary: Optional[str] = None
     progress = _ProgressDisplay(not quiet)
     try:
-        state = wait_for_state(
-            api,
-            transfer_id,
-            ("ready",),
-            transfer_timeout,
-            quiet,
-            progress,
-            "copy from NAS to S3",
-        )
-        ready = True
-        remote_digest = state.get("sha256")
-        if not isinstance(remote_digest, str) or len(remote_digest) != 64:
-            raise ProtocolError("server returned an invalid SHA-256 digest")
+        if pipeline:
+            state = initial
+        else:
+            state = wait_for_state(
+                api,
+                transfer_id,
+                ("ready",),
+                transfer_timeout,
+                quiet,
+                progress,
+                "copy from NAS to S3",
+            )
+            ready = True
         fd, temporary = tempfile.mkstemp(
             prefix=".%s." % destination.name,
             suffix=".nass3cp-part",
@@ -605,10 +882,23 @@ def download(
         )
         digest = hashlib.sha256()
         transferred = 0
-        progress.update("download from S3", 0, size, force=True)
+        progress_label = "copy from NAS via S3" if pipeline else "download from S3"
+        progress.update(progress_label, 0, size, force=True)
         with os.fdopen(fd, "wb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
-            for start in range(0, chunks, jobs):
-                count = min(jobs, chunks - start)
+            start = 0
+            while start < chunks:
+                if pipeline:
+                    state = _wait_for_pipeline_chunk(
+                        api,
+                        transfer_id,
+                        chunks,
+                        start,
+                        transfer_timeout,
+                    )
+                    staged, _ = _pipeline_counts(state, chunks)
+                    count = min(jobs, staged - start, chunks - start)
+                else:
+                    count = min(jobs, chunks - start)
                 items = api.urls(transfer_id, start, count)
                 if len(items) != count:
                     raise ProtocolError("server returned the wrong number of download URLs")
@@ -618,13 +908,20 @@ def download(
                     if item.get("index") != index:
                         raise ProtocolError("server returned out-of-order download URLs")
                     expected = min(chunk_size, size - index * chunk_size)
-                    request_specs.append((item, expected))
+                    expected_digest = item.get("sha256") if pipeline else None
+                    if pipeline and (
+                        not isinstance(expected_digest, str)
+                        or len(expected_digest) != 64
+                        or any(character not in "0123456789abcdef" for character in expected_digest)
+                    ):
+                        raise ProtocolError("server returned an invalid chunk SHA-256 digest")
+                    request_specs.append((item, expected, expected_digest))
                 batch_progress = _BatchProgress(
                     progress,
-                    "download from S3",
+                    progress_label,
                     transferred,
                     size,
-                    [expected for _, expected in request_specs],
+                    [expected for _, expected, _ in request_specs],
                 )
                 futures = [
                     executor.submit(
@@ -635,16 +932,46 @@ def download(
                         expected,
                         progress=None if quiet else batch_progress.callback(offset),
                     )
-                    for offset, (item, expected) in enumerate(request_specs)
+                    for offset, (item, expected, _) in enumerate(request_specs)
                 ]
-                for future in futures:
+                for offset, future in enumerate(futures):
                     data = future.result()
+                    chunk_digest = hashlib.sha256(data).hexdigest()
+                    expected_digest = request_specs[offset][2]
+                    if pipeline and chunk_digest != expected_digest:
+                        raise Nass3cpError("chunk %d SHA-256 mismatch" % (start + offset))
                     handle.write(data)
                     digest.update(data)
                     transferred += len(data)
-                progress.update("download from S3", transferred, size, force=transferred == size)
+                    if pipeline:
+                        updated = api.acknowledge_chunk(
+                            transfer_id,
+                            start + offset,
+                            chunk_digest,
+                        )
+                        _check_pipeline_state(updated, ("preparing", "ready"))
+                        _, consumed = _pipeline_counts(updated, chunks)
+                        if consumed != start + offset + 1:
+                            raise ProtocolError("server did not acknowledge the downloaded chunk")
+                start += count
+                progress.update(progress_label, transferred, size, force=transferred == size)
             handle.flush()
             os.fsync(handle.fileno())
+        if pipeline:
+            state = wait_for_state(
+                api,
+                transfer_id,
+                ("ready",),
+                transfer_timeout,
+                True,
+            )
+        remote_digest = state.get("sha256")
+        if (
+            not isinstance(remote_digest, str)
+            or len(remote_digest) != 64
+            or any(character not in "0123456789abcdef" for character in remote_digest)
+        ):
+            raise ProtocolError("server returned an invalid SHA-256 digest")
         if transferred != size or digest.hexdigest() != remote_digest:
             raise Nass3cpError("end-to-end SHA-256 mismatch")
         if destination.exists() and not overwrite:

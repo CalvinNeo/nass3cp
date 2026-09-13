@@ -2,19 +2,24 @@ import hashlib
 import http.client
 import io
 import json
+import os
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from nass3cp.config import S3Config, ServerConfig
+from nass3cp import client
 from nass3cp.client import ApiClient
+from nass3cp.s3 import PresignedRequest
 from nass3cp.server import (
     ApiError,
     Nass3cpHTTPServer,
     RequestHandler,
     ServerApp,
+    TransferStore,
     check_s3,
 )
 
@@ -22,15 +27,29 @@ from nass3cp.server import (
 class FakeS3:
     def __init__(self):
         self.objects = {}
+        self.max_objects = 0
+        self.fail_deletes = False
 
     def put_chunk(self, transfer_id, index, data):
         self.objects[(transfer_id, index)] = data
+        self.max_objects = max(self.max_objects, len(self.objects))
 
     def get_chunk(self, transfer_id, index):
         try:
             return io.BytesIO(self.objects[(transfer_id, index)])
         except KeyError as exc:
             raise OSError("missing fake object") from exc
+
+    def delete_chunk(self, transfer_id, index):
+        if self.fail_deletes:
+            raise OSError("simulated delete failure")
+        self.objects.pop((transfer_id, index), None)
+
+    def presign_chunk(self, method, transfer_id, index, content_length=None):
+        return PresignedRequest(
+            url="https://s3.example.test/%s/%d" % (transfer_id, index),
+            headers={},
+        )
 
     def cleanup(self, transfer_id, chunks):
         for index in range(chunks):
@@ -78,6 +97,14 @@ class ServerTransferTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def wait_until(self, predicate, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.01)
+        self.fail("condition was not met before timeout")
+
     def test_upload_is_verified_and_atomically_installed(self):
         content = b"abcdefghij"
         state = self.app.create_upload(
@@ -100,6 +127,130 @@ class ServerTransferTests(unittest.TestCase):
         self.assertEqual(self.app.store.get(transfer_id)["status"], "complete")
         self.assertFalse(self.fake.objects)
         self.assertFalse(list(self.root.glob(".nass3cp-*.part")))
+
+    def test_pipeline_upload_verifies_and_deletes_each_chunk(self):
+        content = b"abcdefghijklmnopqrstuvwxyz"
+        state = self.app.create_upload(
+            {
+                "path": "pipeline.bin",
+                "size": len(content),
+                "mtime_ns": 123456789,
+                "overwrite": False,
+                "inflight": 3,
+            }
+        )
+        transfer_id = state["id"]
+        worker = threading.Thread(
+            target=self.app._receive_upload_pipeline,
+            args=(transfer_id,),
+            daemon=True,
+        )
+        worker.start()
+
+        for index in range(state["chunks"]):
+            while index - self.app.store.get(transfer_id)["chunks_consumed"] >= 3:
+                time.sleep(0.01)
+            start = index * state["chunk_size"]
+            data = content[start : start + state["chunk_size"]]
+            self.fake.put_chunk(transfer_id, index, data)
+            self.app.announce_upload_chunk(
+                transfer_id,
+                index,
+                {"sha256": hashlib.sha256(data).hexdigest()},
+            )
+
+        self.app.commit_upload(
+            transfer_id,
+            {"sha256": hashlib.sha256(content).hexdigest()},
+        )
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual((self.root / "pipeline.bin").read_bytes(), content)
+        finished = self.app.store.get(transfer_id)
+        self.assertEqual(finished["status"], "complete")
+        self.assertEqual(finished["chunks_consumed"], state["chunks"])
+        self.assertLessEqual(self.fake.max_objects, 3)
+        self.assertFalse(self.fake.objects)
+
+    def test_pipeline_upload_url_window_is_enforced(self):
+        state = self.app.create_upload(
+            {
+                "path": "pipeline.bin",
+                "size": 16,
+                "overwrite": False,
+                "inflight": 3,
+            }
+        )
+        with self.assertRaises(ApiError) as caught:
+            self.app.urls(state["id"], 0, 4)
+        self.assertEqual(caught.exception.code, "inflight_limit")
+
+    def test_pipeline_upload_rejects_a_bad_chunk_digest(self):
+        state = self.app.create_upload(
+            {
+                "path": "bad-pipeline.bin",
+                "size": 4,
+                "overwrite": False,
+                "inflight": 3,
+            }
+        )
+        transfer_id = state["id"]
+        worker = threading.Thread(
+            target=self.app._receive_upload_pipeline,
+            args=(transfer_id,),
+            daemon=True,
+        )
+        with self.assertLogs("nass3cp.server", level="ERROR"):
+            worker.start()
+            self.fake.put_chunk(transfer_id, 0, b"data")
+            self.app.announce_upload_chunk(
+                transfer_id,
+                0,
+                {"sha256": hashlib.sha256(b"evil").hexdigest()},
+            )
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.app.store.get(transfer_id)["status"], "error")
+        self.assertFalse((self.root / "bad-pipeline.bin").exists())
+        self.assertFalse(self.fake.objects)
+
+    def test_pipeline_upload_does_not_release_slot_when_delete_fails(self):
+        state = self.app.create_upload(
+            {
+                "path": "delete-failure.bin",
+                "size": 4,
+                "overwrite": False,
+                "inflight": 3,
+            }
+        )
+        transfer_id = state["id"]
+        worker = threading.Thread(
+            target=self.app._receive_upload_pipeline,
+            args=(transfer_id,),
+            daemon=True,
+        )
+        self.fake.put_chunk(transfer_id, 0, b"data")
+        self.fake.fail_deletes = True
+        with self.assertLogs("nass3cp.server", level="ERROR"), mock.patch(
+            "nass3cp.server.time.sleep", return_value=None
+        ):
+            worker.start()
+            self.app.announce_upload_chunk(
+                transfer_id,
+                0,
+                {"sha256": hashlib.sha256(b"data").hexdigest()},
+            )
+            worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        failed = self.app.store.get(transfer_id)
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["chunks_consumed"], 0)
+        self.assertFalse(failed["objects_cleaned"])
+        self.assertIn((transfer_id, 0), self.fake.objects)
+        self.assertFalse((self.root / "delete-failure.bin").exists())
 
     def test_bad_upload_digest_does_not_replace_destination(self):
         destination = self.root / "dest.bin"
@@ -135,12 +286,98 @@ class ServerTransferTests(unittest.TestCase):
             content,
         )
 
+    def test_pipeline_download_refills_only_after_verified_ack(self):
+        content = b"abcdefghijklmnopqrstuvwxyz"
+        source = self.root / "pipeline-source.bin"
+        source.write_bytes(content)
+        state = self.app.create_download({"path": source.name, "inflight": 3})
+        transfer_id = state["id"]
+        worker = threading.Thread(
+            target=self.app._prepare_download,
+            args=(transfer_id,),
+            daemon=True,
+        )
+        worker.start()
+
+        for index in range(state["chunks"]):
+            self.wait_until(
+                lambda current=index: self.app.store.get(transfer_id)["chunks_staged"]
+                > current
+                or self.app.store.get(transfer_id)["status"] == "error"
+            )
+            current = self.app.store.get(transfer_id)
+            self.assertNotEqual(current["status"], "error")
+            item = self.app.urls(transfer_id, index, 1)["items"][0]
+            data = self.fake.objects[(transfer_id, index)]
+            digest = hashlib.sha256(data).hexdigest()
+            self.assertEqual(item["sha256"], digest)
+            self.app.acknowledge_download_chunk(
+                transfer_id,
+                index,
+                {"sha256": digest},
+            )
+            self.assertNotIn((transfer_id, index), self.fake.objects)
+
+        worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        prepared = self.app.store.get(transfer_id)
+        self.assertEqual(prepared["status"], "ready")
+        self.assertEqual(prepared["sha256"], hashlib.sha256(content).hexdigest())
+        self.assertLessEqual(self.fake.max_objects, 3)
+        finished = self.app.acknowledge_download(transfer_id)
+        self.assertEqual(finished["status"], "complete")
+        self.assertTrue(finished["objects_cleaned"])
+
     def test_paths_outside_roots_are_rejected(self):
         outside = self.base / "outside.bin"
         outside.write_bytes(b"secret")
         with self.assertRaises(ApiError) as caught:
             self.app.create_download({"path": str(outside)})
         self.assertEqual(caught.exception.code, "path_not_allowed")
+
+    def test_list_directory_is_sorted_and_paginated(self):
+        (self.root / "zeta.bin").write_bytes(b"1234")
+        (self.root / "Alpha").mkdir()
+        (self.root / "middle.txt").write_bytes(b"x")
+
+        first = self.app.list_directory({"path": ".", "cursor": 0, "limit": 2})
+        second = self.app.list_directory(
+            {"path": ".", "cursor": first["next_cursor"], "limit": 2}
+        )
+        entries = first["entries"] + second["entries"]
+
+        self.assertEqual([entry["name"] for entry in entries], ["Alpha", "middle.txt", "zeta.bin"])
+        self.assertEqual(entries[0]["type"], "directory")
+        self.assertIsNone(entries[0]["size"])
+        self.assertEqual(entries[1]["type"], "file")
+        self.assertEqual(entries[1]["size"], 1)
+        self.assertEqual(first["next_cursor"], 2)
+        self.assertIsNone(second["next_cursor"])
+        self.assertEqual(first["total"], 3)
+
+    def test_list_directory_rejects_paths_outside_roots(self):
+        with self.assertRaises(ApiError) as caught:
+            self.app.list_directory({"path": str(self.base), "cursor": 0, "limit": 10})
+        self.assertEqual(caught.exception.code, "path_not_allowed")
+
+    def test_transfer_store_retries_a_transient_windows_replace_failure(self):
+        original_replace = os.replace
+        attempts = []
+
+        def flaky_replace(source, destination):
+            attempts.append((source, destination))
+            if len(attempts) == 1:
+                raise PermissionError("temporarily locked")
+            return original_replace(source, destination)
+
+        with mock.patch("nass3cp.server.os.replace", side_effect=flaky_replace), mock.patch(
+            "nass3cp.server.time.sleep"
+        ):
+            store = TransferStore(self.base / "retry-state")
+            state = store.create({"status": "ready"})
+
+        self.assertEqual(store.get(state["id"])["status"], "ready")
+        self.assertEqual(len(attempts), 2)
 
     def test_restart_marks_active_transfer_failed_and_removes_partial_file(self):
         state = self.app.create_upload({"path": "dest.bin", "size": 4, "overwrite": False})
@@ -198,7 +435,53 @@ class ServerTransferTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_http_api_accepts_pipeline_chunk_ready(self):
+        server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_port, timeout=5
+            )
+            body = json.dumps(
+                {
+                    "path": "api-pipeline.bin",
+                    "size": 4,
+                    "overwrite": False,
+                    "inflight": 3,
+                }
+            )
+            headers = {
+                "Authorization": "Bearer password",
+                "Content-Type": "application/json",
+            }
+            connection.request("POST", "/v1/transfers/upload", body=body, headers=headers)
+            response = connection.getresponse()
+            state = json.loads(response.read())
+            self.assertEqual(response.status, 201)
+            self.assertTrue(state["pipeline"])
+
+            transfer_id = state["id"]
+            self.fake.put_chunk(transfer_id, 0, b"data")
+            ready_body = json.dumps({"sha256": hashlib.sha256(b"data").hexdigest()})
+            connection.request(
+                "POST",
+                "/v1/transfers/%s/chunks/0/ready" % transfer_id,
+                body=ready_body,
+                headers=headers,
+            )
+            response = connection.getresponse()
+            announced = json.loads(response.read())
+            self.assertEqual(response.status, 202)
+            self.assertEqual(announced["chunks_staged"], 1)
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_api_client_authenticates_over_explicit_http(self):
+        (self.root / "listed.bin").write_bytes(b"data")
         server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -210,6 +493,77 @@ class ServerTransferTests(unittest.TestCase):
             )
             health = api.request("GET", "/v1/health")
             self.assertEqual(health["status"], "ok")
+            listing = api.list_directory(".", 0, 1)
+            self.assertEqual(listing["entries"][0]["name"], "listed.bin")
+            self.assertIsNone(listing["next_cursor"])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_http_pipeline_round_trip_keeps_cloud_window_bounded(self):
+        self.app.start_worker = lambda function, *args: threading.Thread(
+            target=function,
+            args=args,
+            daemon=True,
+        ).start()
+        server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def data_request(method, item, data=None, expected=None, attempts=4, progress=None):
+            transfer_id, raw_index = item["url"].rsplit("/", 2)[-2:]
+            index = int(raw_index)
+            if method == "PUT":
+                self.fake.put_chunk(transfer_id, index, data)
+                if progress is not None:
+                    progress(len(data))
+                return b""
+            response = self.fake.get_chunk(transfer_id, index)
+            try:
+                value = response.read()
+            finally:
+                response.close()
+            if expected is not None and len(value) != expected:
+                raise AssertionError("wrong fake chunk size")
+            if progress is not None:
+                progress(len(value))
+            return value
+
+        try:
+            api = ApiClient(
+                "http://127.0.0.1:%d" % server.server_port,
+                "password",
+                timeout=5,
+            )
+            content = bytes(range(256)) * 4
+            source = self.base / "client-source.bin"
+            source.write_bytes(content)
+            copied_back = self.base / "client-copy.bin"
+            with mock.patch("nass3cp.client._data_request", side_effect=data_request):
+                client.upload(
+                    api,
+                    str(source),
+                    "round-trip.bin",
+                    False,
+                    8,
+                    5,
+                    True,
+                    3,
+                )
+                client.download(
+                    api,
+                    "round-trip.bin",
+                    str(copied_back),
+                    False,
+                    8,
+                    5,
+                    True,
+                    3,
+                )
+            self.assertEqual(copied_back.read_bytes(), content)
+            self.assertLessEqual(self.fake.max_objects, 3)
+            self.assertFalse(self.fake.objects)
         finally:
             server.shutdown()
             server.server_close()

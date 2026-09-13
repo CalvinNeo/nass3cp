@@ -8,6 +8,7 @@ import re
 import secrets
 import signal
 import ssl
+import stat
 import sys
 import tempfile
 import threading
@@ -38,6 +39,11 @@ PUBLIC_FIELDS = (
     "sha256",
     "mtime_ns",
     "bytes_transferred",
+    "pipeline",
+    "inflight",
+    "chunks_staged",
+    "chunks_consumed",
+    "producer_complete",
     "created_at",
     "updated_at",
     "error",
@@ -93,7 +99,14 @@ class TransferStore:
                 json.dump(state, handle, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temporary, str(target))
+            for attempt in range(5):
+                try:
+                    os.replace(temporary, str(target))
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.01 * (2 ** attempt))
         except Exception:
             try:
                 os.unlink(temporary)
@@ -179,6 +192,7 @@ class ServerApp:
         self.s3 = S3Relay(config.s3)
         self.store = TransferStore(config.state_dir)
         self._stop = threading.Event()
+        self._pipeline_condition = threading.Condition()
 
     def validate(self) -> None:
         validate_server_config(self.config)
@@ -212,11 +226,122 @@ class ServerApp:
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "source is not a regular file")
         return candidate
 
+    def resolve_remote_directory(self, requested: str) -> Path:
+        if "\x00" in requested:
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_path", "invalid NAS path")
+        raw = Path(requested or ".")
+        if raw.is_absolute():
+            candidate = raw.resolve(strict=False)
+        else:
+            candidate = (self.config.allowed_roots[0] / raw).resolve(strict=False)
+        if not any(_inside(candidate, root) for root in self.config.allowed_roots):
+            raise ApiError(
+                HTTPStatus.FORBIDDEN,
+                "path_not_allowed",
+                "NAS path is outside allowed roots",
+            )
+        if not candidate.exists():
+            raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "NAS directory does not exist")
+        if not candidate.is_dir():
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "not_a_directory",
+                "NAS path is not a directory",
+            )
+        return candidate
+
+    def list_directory(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        requested = body.get("path")
+        cursor = body.get("cursor", 0)
+        limit = body.get("limit", 500)
+        if not isinstance(requested, str):
+            raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "cursor must be a non-negative integer",
+            )
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit <= 0
+            or limit > 1000
+        ):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "limit must be an integer between 1 and 1000",
+            )
+
+        directory = self.resolve_remote_directory(requested)
+        entries: List[Dict[str, Any]] = []
+        try:
+            with os.scandir(str(directory)) as iterator:
+                for entry in iterator:
+                    try:
+                        details = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        # A concurrently removed entry is simply absent from this page.
+                        continue
+                    mode = details.st_mode
+                    if stat.S_ISDIR(mode):
+                        kind = "directory"
+                    elif stat.S_ISREG(mode):
+                        kind = "file"
+                    elif stat.S_ISLNK(mode):
+                        kind = "symlink"
+                    else:
+                        kind = "other"
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "type": kind,
+                            "size": details.st_size if kind == "file" else None,
+                            "mtime_ns": details.st_mtime_ns,
+                        }
+                    )
+        except FileNotFoundError as exc:
+            raise ApiError(
+                HTTPStatus.NOT_FOUND,
+                "not_found",
+                "NAS directory disappeared while it was being listed",
+            ) from exc
+        except NotADirectoryError as exc:
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "not_a_directory",
+                "NAS path is not a directory",
+            ) from exc
+        except PermissionError as exc:
+            raise ApiError(
+                HTTPStatus.FORBIDDEN,
+                "permission_denied",
+                "permission denied while listing NAS directory",
+            ) from exc
+        except OSError as exc:
+            raise ApiError(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "list_failed",
+                "could not list NAS directory",
+            ) from exc
+
+        entries.sort(key=lambda item: (str(item["name"]).casefold(), str(item["name"])))
+        end = min(len(entries), cursor + limit)
+        return {
+            "path": requested or ".",
+            "entries": entries[cursor:end],
+            "next_cursor": end if end < len(entries) else None,
+            "total": len(entries),
+        }
+
     def create_upload(self, body: Mapping[str, Any]) -> Dict[str, Any]:
         requested = body.get("path")
         size = body.get("size")
         overwrite = body.get("overwrite", False)
         mtime_ns = body.get("mtime_ns")
+        pipeline = "inflight" in body
+        inflight = body.get("inflight")
         if not isinstance(requested, str):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -227,12 +352,23 @@ class ServerApp:
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "overwrite must be a boolean")
         if mtime_ns is not None and (isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int) or mtime_ns < 0):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "mtime_ns must be a non-negative integer")
+        if pipeline and (
+            isinstance(inflight, bool)
+            or not isinstance(inflight, int)
+            or inflight <= 0
+            or inflight > 128
+        ):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "inflight must be an integer between 1 and 128",
+            )
         destination = self.resolve_remote(requested, write=True, overwrite=overwrite)
         chunks = (size + self.config.chunk_size - 1) // self.config.chunk_size if size else 0
-        return self.store.create(
+        state = self.store.create(
             {
                 "direction": "upload",
-                "status": "awaiting_upload",
+                "status": "receiving" if pipeline else "awaiting_upload",
                 "path": str(destination),
                 "size": size,
                 "mtime_ns": mtime_ns,
@@ -243,13 +379,35 @@ class ServerApp:
                 "sha256": None,
                 "error": None,
                 "objects_cleaned": chunks == 0,
+                "pipeline": pipeline,
+                "inflight": inflight if pipeline else None,
+                "chunks_staged": 0,
+                "chunks_consumed": 0,
+                "producer_complete": False,
+                "ready_chunks": {},
             }
         )
+        if pipeline:
+            self.start_worker(self._receive_upload_pipeline, str(state["id"]))
+        return state
 
     def create_download(self, body: Mapping[str, Any]) -> Dict[str, Any]:
         requested = body.get("path")
+        pipeline = "inflight" in body
+        inflight = body.get("inflight")
         if not isinstance(requested, str):
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_request", "path must be a string")
+        if pipeline and (
+            isinstance(inflight, bool)
+            or not isinstance(inflight, int)
+            or inflight <= 0
+            or inflight > 128
+        ):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "inflight must be an integer between 1 and 128",
+            )
         source = self.resolve_remote(requested, write=False)
         stat = source.stat()
         if stat.st_size > self.config.max_file_size:
@@ -274,6 +432,12 @@ class ServerApp:
                 "sha256": None,
                 "error": None,
                 "objects_cleaned": chunks == 0,
+                "pipeline": pipeline,
+                "inflight": inflight if pipeline else None,
+                "chunks_staged": 0,
+                "chunks_consumed": 0,
+                "producer_complete": False,
+                "ready_chunks": {},
             }
         )
         self.start_worker(self._prepare_download, str(state["id"]))
@@ -282,12 +446,15 @@ class ServerApp:
     def urls(self, transfer_id: str, start: int, count: int) -> Dict[str, Any]:
         state = self.store.get(transfer_id)
         direction = state.get("direction")
+        pipeline = state.get("pipeline") is True
         if direction == "upload":
-            if state.get("status") != "awaiting_upload":
+            allowed = ("receiving",) if pipeline else ("awaiting_upload",)
+            if state.get("status") not in allowed:
                 raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "upload URLs are no longer available")
             method = "PUT"
         elif direction == "download":
-            if state.get("status") != "ready":
+            allowed = ("preparing", "ready") if pipeline else ("ready",)
+            if state.get("status") not in allowed:
                 raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "download is not ready")
             method = "GET"
         else:
@@ -296,6 +463,26 @@ class ServerApp:
         if start < 0 or count <= 0 or count > 128 or start > chunks:
             raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_range", "invalid URL batch range")
         end = min(start + count, chunks)
+        ready_chunks = state.get("ready_chunks", {})
+        if not isinstance(ready_chunks, dict):
+            raise ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "invalid_state", "invalid chunk state")
+        if pipeline and direction == "upload":
+            consumed = int(state.get("chunks_consumed", 0))
+            inflight = int(state.get("inflight", 0))
+            if start < consumed or end > consumed + inflight:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "inflight_limit",
+                    "requested upload URLs exceed the inflight window",
+                )
+        if pipeline and direction == "download":
+            missing = [index for index in range(start, end) if str(index) not in ready_chunks]
+            if missing:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "chunk_not_ready",
+                    "download chunk %d is not ready" % missing[0],
+                )
         items = []
         for index in range(start, end):
             expected = min(
@@ -308,7 +495,10 @@ class ServerApp:
                 index,
                 content_length=expected if method == "PUT" else None,
             )
-            items.append({"index": index, "url": signed.url, "headers": signed.headers})
+            item = {"index": index, "url": signed.url, "headers": signed.headers}
+            if pipeline and direction == "download":
+                item["sha256"] = ready_chunks[str(index)]
+            items.append(item)
         return {"items": items, "next": end if end < chunks else None}
 
     def commit_upload(self, transfer_id: str, body: Mapping[str, Any]) -> Dict[str, Any]:
@@ -318,6 +508,37 @@ class ServerApp:
         current = self.store.get(transfer_id)
         if current.get("direction") != "upload":
             raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "not an upload transfer")
+        if current.get("pipeline") is True:
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                if current.get("status") == "complete" or current.get("producer_complete"):
+                    if current.get("sha256") != digest:
+                        raise ApiError(
+                            HTTPStatus.CONFLICT,
+                            "invalid_state",
+                            "upload was committed with a different digest",
+                        )
+                    return current
+                if current.get("status") != "receiving":
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "invalid_state",
+                        "upload is not receiving chunks",
+                    )
+                if int(current.get("chunks_staged", 0)) != int(current["chunks"]):
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "incomplete_upload",
+                        "all chunks must be uploaded before commit",
+                    )
+                state = self.store.update(
+                    transfer_id,
+                    sha256=digest,
+                    producer_complete=True,
+                    error=None,
+                )
+                self._pipeline_condition.notify_all()
+                return state
         if current.get("status") in ("receiving", "complete"):
             if current.get("sha256") != digest:
                 raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "upload was committed with a different digest")
@@ -333,10 +554,123 @@ class ServerApp:
         self.start_worker(self._receive_upload, transfer_id)
         return state
 
+    def announce_upload_chunk(
+        self, transfer_id: str, index: int, body: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        digest = body.get("sha256")
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "sha256 must be lowercase hexadecimal",
+            )
+        with self._pipeline_condition:
+            state = self.store.get(transfer_id)
+            if state.get("direction") != "upload" or state.get("pipeline") is not True:
+                raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "not a pipeline upload")
+            if index < 0 or index >= int(state["chunks"]):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_range", "invalid chunk index")
+            consumed = int(state.get("chunks_consumed", 0))
+            if index < consumed:
+                return state
+            if state.get("status") != "receiving" or state.get("producer_complete"):
+                raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "upload is no longer accepting chunks")
+            if index >= consumed + int(state["inflight"]):
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "inflight_limit",
+                    "chunk exceeds the inflight window",
+                )
+            ready = dict(state.get("ready_chunks", {}))
+            key = str(index)
+            if key in ready:
+                if ready[key] != digest:
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "invalid_state",
+                        "chunk was announced with a different digest",
+                    )
+                return state
+            ready[key] = digest
+            state = self.store.update(
+                transfer_id,
+                ready_chunks=ready,
+                chunks_staged=int(state.get("chunks_staged", 0)) + 1,
+            )
+            self._pipeline_condition.notify_all()
+            return state
+
+    def acknowledge_download_chunk(
+        self, transfer_id: str, index: int, body: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        digest = body.get("sha256")
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            raise ApiError(
+                HTTPStatus.BAD_REQUEST,
+                "invalid_request",
+                "sha256 must be lowercase hexadecimal",
+            )
+        with self._pipeline_condition:
+            state = self.store.get(transfer_id)
+            if state.get("direction") != "download" or state.get("pipeline") is not True:
+                raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "not a pipeline download")
+            consumed = int(state.get("chunks_consumed", 0))
+            if index < consumed:
+                return state
+            if index != consumed:
+                raise ApiError(
+                    HTTPStatus.CONFLICT,
+                    "out_of_order",
+                    "download chunks must be acknowledged in order",
+                )
+            if state.get("status") not in ("preparing", "ready"):
+                raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "download is not active")
+            ready = dict(state.get("ready_chunks", {}))
+            expected_digest = ready.get(str(index))
+            if expected_digest is None:
+                raise ApiError(HTTPStatus.CONFLICT, "chunk_not_ready", "download chunk is not ready")
+            if digest != expected_digest:
+                raise ApiError(HTTPStatus.CONFLICT, "digest_mismatch", "download chunk digest differs")
+            self._retry(
+                lambda: self.s3.delete_chunk(transfer_id, index),
+                "delete chunk %d" % index,
+            )
+            ready.pop(str(index), None)
+            consumed += 1
+            state = self.store.update(
+                transfer_id,
+                ready_chunks=ready,
+                chunks_consumed=consumed,
+                objects_cleaned=consumed == int(state["chunks"]),
+            )
+            self._pipeline_condition.notify_all()
+            return state
+
     def acknowledge_download(self, transfer_id: str) -> Dict[str, Any]:
         state = self.store.get(transfer_id)
         if state.get("direction") != "download":
             raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "not a download transfer")
+        if state.get("pipeline") is True:
+            with self._pipeline_condition:
+                state = self.store.get(transfer_id)
+                if state.get("status") == "complete":
+                    return state
+                if state.get("status") != "ready" or not state.get("producer_complete"):
+                    raise ApiError(HTTPStatus.CONFLICT, "invalid_state", "download is not ready")
+                if int(state.get("chunks_consumed", 0)) != int(state["chunks"]):
+                    raise ApiError(
+                        HTTPStatus.CONFLICT,
+                        "incomplete_download",
+                        "all chunks must be acknowledged before completion",
+                    )
+                state = self.store.update(
+                    transfer_id,
+                    status="complete",
+                    error=None,
+                    objects_cleaned=True,
+                )
+                self._pipeline_condition.notify_all()
+                return state
         if state.get("status") in ("cleaning", "complete"):
             return state
         state = self.store.transition(transfer_id, ("ready",), "cleaning")
@@ -344,6 +678,21 @@ class ServerApp:
         return state
 
     def abort(self, transfer_id: str) -> Dict[str, Any]:
+        current = self.store.get(transfer_id)
+        if current.get("pipeline") is True and current.get("status") in (
+            "receiving",
+            "preparing",
+        ):
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                if current.get("status") in ("receiving", "preparing"):
+                    state = self.store.update(
+                        transfer_id,
+                        status="error",
+                        error="transfer aborted by client",
+                    )
+                    self._pipeline_condition.notify_all()
+                    return state
         state = self.store.transition(
             transfer_id,
             ("awaiting_upload", "ready", "error"),
@@ -356,6 +705,9 @@ class ServerApp:
     def start_worker(self, function: Callable[..., None], *args: Any) -> None:
         thread = threading.Thread(target=function, args=args, daemon=True)
         thread.start()
+
+    def _pipeline_expired(self, state: Mapping[str, Any]) -> bool:
+        return time.time() - float(state.get("updated_at", 0)) >= self.config.transfer_ttl_seconds
 
     @staticmethod
     def _retry(function: Callable[[], Any], description: str, attempts: int = 4) -> Any:
@@ -453,19 +805,148 @@ class ServerApp:
                 bytes_transferred=transferred,
                 error=None,
             )
-            cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
+            cleaned = self._cleanup_state_objects(state)
             self.store.update(transfer_id, objects_cleaned=cleaned)
             LOG.info("upload %s completed", transfer_id)
         except Exception as exc:
             LOG.error("upload %s failed: %s", transfer_id, exc)
             self.store.update(transfer_id, status="error", error=str(exc))
-            cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
+            cleaned = self._cleanup_state_objects(self.store.get(transfer_id))
+            self.store.update(transfer_id, objects_cleaned=cleaned)
+        finally:
+            self._remove_upload_temporary(state)
+
+    def _receive_upload_pipeline(self, transfer_id: str) -> None:
+        state = self.store.get(transfer_id)
+        destination = Path(str(state["path"]))
+        temporary = self._upload_temporary_path(state)
+        try:
+            self._revalidate_upload_destination(destination)
+            fd = os.open(
+                str(temporary),
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+            digest = hashlib.sha256()
+            transferred = 0
+            with os.fdopen(fd, "wb") as handle:
+                try:
+                    os.chmod(str(temporary), 0o600)
+                except OSError:
+                    pass
+                for index in range(int(state["chunks"])):
+                    with self._pipeline_condition:
+                        while True:
+                            current = self.store.get(transfer_id)
+                            if current.get("status") != "receiving":
+                                raise Nass3cpError(
+                                    str(current.get("error") or "upload was cancelled")
+                                )
+                            if self._pipeline_expired(current):
+                                raise Nass3cpError("upload pipeline timed out waiting for a chunk")
+                            ready = current.get("ready_chunks", {})
+                            chunk_digest = ready.get(str(index)) if isinstance(ready, dict) else None
+                            if isinstance(chunk_digest, str):
+                                break
+                            if current.get("producer_complete"):
+                                raise Nass3cpError("upload committed before all chunks were ready")
+                            self._pipeline_condition.wait(timeout=1.0)
+
+                    expected = min(
+                        int(state["chunk_size"]),
+                        int(state["size"]) - transferred,
+                    )
+                    data = self._get_chunk_bytes(transfer_id, index, expected)
+                    if hashlib.sha256(data).hexdigest() != chunk_digest:
+                        raise Nass3cpError("chunk %d SHA-256 mismatch" % index)
+                    handle.write(data)
+                    digest.update(data)
+                    self._retry(
+                        lambda current=index: self.s3.delete_chunk(transfer_id, current),
+                        "delete chunk %d" % index,
+                    )
+                    transferred += len(data)
+
+                    with self._pipeline_condition:
+                        current = self.store.get(transfer_id)
+                        if current.get("status") != "receiving":
+                            raise Nass3cpError(
+                                str(current.get("error") or "upload was cancelled")
+                            )
+                        ready = dict(current.get("ready_chunks", {}))
+                        if ready.get(str(index)) != chunk_digest:
+                            raise Nass3cpError("chunk state changed while it was being received")
+                        ready.pop(str(index), None)
+                        self.store.update(
+                            transfer_id,
+                            ready_chunks=ready,
+                            chunks_consumed=index + 1,
+                            bytes_transferred=transferred,
+                            objects_cleaned=index + 1 == int(state["chunks"]),
+                        )
+                        self._pipeline_condition.notify_all()
+
+                with self._pipeline_condition:
+                    while True:
+                        current = self.store.get(transfer_id)
+                        if current.get("status") != "receiving":
+                            raise Nass3cpError(
+                                str(current.get("error") or "upload was cancelled")
+                            )
+                        if self._pipeline_expired(current):
+                            raise Nass3cpError("upload pipeline timed out waiting for commit")
+                        if current.get("producer_complete"):
+                            break
+                        self._pipeline_condition.wait(timeout=1.0)
+                handle.flush()
+                os.fsync(handle.fileno())
+
+            if digest.hexdigest() != current.get("sha256"):
+                raise Nass3cpError("end-to-end SHA-256 mismatch")
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                if current.get("status") != "receiving":
+                    raise Nass3cpError(str(current.get("error") or "upload was cancelled"))
+                self._revalidate_upload_destination(destination)
+                if destination.exists() and not state.get("overwrite"):
+                    raise Nass3cpError(
+                        "destination appeared during transfer; refusing to overwrite it"
+                    )
+                if state.get("mtime_ns") is not None:
+                    os.utime(
+                        str(temporary),
+                        ns=(int(state["mtime_ns"]), int(state["mtime_ns"])),
+                    )
+                os.replace(str(temporary), str(destination))
+                self.store.update(
+                    transfer_id,
+                    status="complete",
+                    bytes_transferred=transferred,
+                    error=None,
+                    objects_cleaned=True,
+                )
+                self._pipeline_condition.notify_all()
+            LOG.info("pipeline upload %s completed", transfer_id)
+        except Exception as exc:
+            LOG.error("pipeline upload %s failed: %s", transfer_id, exc)
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                message = str(current.get("error") or exc)
+                self.store.update(transfer_id, status="error", error=message)
+                self._pipeline_condition.notify_all()
+            cleaned = self._cleanup_state_objects(self.store.get(transfer_id))
             self.store.update(transfer_id, objects_cleaned=cleaned)
         finally:
             self._remove_upload_temporary(state)
 
     def _prepare_download(self, transfer_id: str) -> None:
         state = self.store.get(transfer_id)
+        if state.get("pipeline") is True:
+            self._prepare_download_pipeline(transfer_id)
+            return
         source = Path(str(state["path"]))
         try:
             digest = hashlib.sha256()
@@ -504,6 +985,94 @@ class ServerApp:
             cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
             self.store.update(transfer_id, objects_cleaned=cleaned)
 
+    def _prepare_download_pipeline(self, transfer_id: str) -> None:
+        state = self.store.get(transfer_id)
+        source = Path(str(state["path"]))
+        try:
+            digest = hashlib.sha256()
+            transferred = 0
+            with source.open("rb") as handle:
+                before = os.fstat(handle.fileno())
+                if before.st_dev != state["source_dev"] or before.st_ino != state["source_ino"]:
+                    raise Nass3cpError("source file was replaced before it could be read")
+                for index in range(int(state["chunks"])):
+                    with self._pipeline_condition:
+                        while True:
+                            current = self.store.get(transfer_id)
+                            if current.get("status") != "preparing":
+                                raise Nass3cpError(
+                                    str(current.get("error") or "download was cancelled")
+                                )
+                            if self._pipeline_expired(current):
+                                raise Nass3cpError(
+                                    "download pipeline timed out waiting for chunk acknowledgement"
+                                )
+                            outstanding = int(current.get("chunks_staged", 0)) - int(
+                                current.get("chunks_consumed", 0)
+                            )
+                            if outstanding < int(state["inflight"]):
+                                break
+                            self._pipeline_condition.wait(timeout=1.0)
+
+                    data = handle.read(int(state["chunk_size"]))
+                    if not data:
+                        raise Nass3cpError("source file became shorter during transfer")
+                    chunk_digest = hashlib.sha256(data).hexdigest()
+                    self._retry(
+                        lambda current=index, payload=data: self.s3.put_chunk(
+                            transfer_id, current, payload
+                        ),
+                        "upload chunk %d" % index,
+                    )
+                    digest.update(data)
+                    transferred += len(data)
+
+                    with self._pipeline_condition:
+                        current = self.store.get(transfer_id)
+                        if current.get("status") != "preparing":
+                            raise Nass3cpError(
+                                str(current.get("error") or "download was cancelled")
+                            )
+                        ready = dict(current.get("ready_chunks", {}))
+                        ready[str(index)] = chunk_digest
+                        self.store.update(
+                            transfer_id,
+                            ready_chunks=ready,
+                            chunks_staged=index + 1,
+                            bytes_transferred=transferred,
+                        )
+                        self._pipeline_condition.notify_all()
+
+                if handle.read(1):
+                    raise Nass3cpError("source file grew during transfer")
+                after = os.fstat(handle.fileno())
+                if after.st_size != before.st_size or after.st_mtime_ns != before.st_mtime_ns:
+                    raise Nass3cpError("source file changed during transfer")
+
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                if current.get("status") != "preparing":
+                    raise Nass3cpError(str(current.get("error") or "download was cancelled"))
+                self.store.update(
+                    transfer_id,
+                    status="ready",
+                    bytes_transferred=transferred,
+                    sha256=digest.hexdigest(),
+                    producer_complete=True,
+                    error=None,
+                )
+                self._pipeline_condition.notify_all()
+            LOG.info("pipeline download %s is ready", transfer_id)
+        except Exception as exc:
+            LOG.error("pipeline download preparation %s failed: %s", transfer_id, exc)
+            with self._pipeline_condition:
+                current = self.store.get(transfer_id)
+                message = str(current.get("error") or exc)
+                self.store.update(transfer_id, status="error", error=message)
+                self._pipeline_condition.notify_all()
+            cleaned = self._cleanup_state_objects(self.store.get(transfer_id))
+            self.store.update(transfer_id, objects_cleaned=cleaned)
+
     def _cleanup_objects(self, transfer_id: str, chunks: int) -> bool:
         try:
             errors = self.s3.cleanup(transfer_id, chunks)
@@ -515,16 +1084,47 @@ class ServerApp:
             return False
         return True
 
+    def _cleanup_state_objects(self, state: Mapping[str, Any]) -> bool:
+        transfer_id = str(state["id"])
+        chunks = int(state["chunks"])
+        if state.get("pipeline") is not True:
+            return self._cleanup_objects(transfer_id, chunks)
+        try:
+            start = int(state.get("chunks_consumed", 0))
+            inflight = int(state.get("inflight", 0))
+        except (TypeError, ValueError):
+            return self._cleanup_objects(transfer_id, chunks)
+        if start < 0 or start > chunks or inflight <= 0:
+            return self._cleanup_objects(transfer_id, chunks)
+        errors = []
+        for index in range(start, min(chunks, start + inflight)):
+            try:
+                self._retry(
+                    lambda current=index: self.s3.delete_chunk(transfer_id, current),
+                    "delete chunk %d" % index,
+                )
+            except Exception as exc:
+                errors.append(str(exc))
+        if errors:
+            LOG.warning(
+                "could not clean %d pipeline object(s) for %s: %s",
+                len(errors),
+                transfer_id,
+                errors[0],
+            )
+            return False
+        return True
+
     def _cleanup_complete(self, transfer_id: str) -> None:
         state = self.store.get(transfer_id)
-        cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
+        cleaned = self._cleanup_state_objects(state)
         self.store.update(
             transfer_id, status="complete", error=None, objects_cleaned=cleaned
         )
 
     def _cleanup_error(self, transfer_id: str, message: str) -> None:
         state = self.store.get(transfer_id)
-        cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
+        cleaned = self._cleanup_state_objects(state)
         self.store.update(
             transfer_id, status="error", error=message, objects_cleaned=cleaned
         )
@@ -535,7 +1135,7 @@ class ServerApp:
                 continue
             transfer_id = str(state["id"])
             self._remove_upload_temporary(state)
-            cleaned = self._cleanup_objects(transfer_id, int(state["chunks"]))
+            cleaned = self._cleanup_state_objects(state)
             self.store.update(transfer_id, objects_cleaned=cleaned)
 
     def janitor(self) -> None:
@@ -550,7 +1150,7 @@ class ServerApp:
                     continue
                 self._remove_upload_temporary(state)
                 if not state.get("objects_cleaned"):
-                    self._cleanup_objects(transfer_id, int(state["chunks"]))
+                    self._cleanup_state_objects(state)
                 self.store.remove(transfer_id)
 
     def stop(self) -> None:
@@ -582,7 +1182,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         LOG.info("%s - %s", self.address_string(), format_string % args)
 
     def _send_json(self, status: int, value: Mapping[str, Any]) -> None:
-        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        # ASCII escaping also makes Unix filenames containing surrogate-escaped bytes safe to return.
+        encoded = json.dumps(value, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -656,12 +1257,28 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             body = self._body()
+            if path == "/v1/list":
+                self._send_json(HTTPStatus.OK, self.app.list_directory(body))
+                return
             if path == "/v1/transfers/upload":
                 state = self.app.create_upload(body)
                 self._send_json(HTTPStatus.CREATED, _public_state(state))
                 return
             if path == "/v1/transfers/download":
                 state = self.app.create_download(body)
+                self._send_json(HTTPStatus.ACCEPTED, _public_state(state))
+                return
+            chunk_match = re.fullmatch(
+                r"/v1/transfers/([0-9a-f]{32})/chunks/([0-9]{1,10})/(ready|ack)",
+                path,
+            )
+            if chunk_match:
+                transfer_id, raw_index, action = chunk_match.groups()
+                index = int(raw_index)
+                if action == "ready":
+                    state = self.app.announce_upload_chunk(transfer_id, index, body)
+                else:
+                    state = self.app.acknowledge_download_chunk(transfer_id, index, body)
                 self._send_json(HTTPStatus.ACCEPTED, _public_state(state))
                 return
             match = re.fullmatch(r"/v1/transfers/([0-9a-f]{32})/(commit|ack|abort)", path)
