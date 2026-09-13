@@ -51,6 +51,7 @@ class CliTests(unittest.TestCase):
         )
         _validate_args(args)
         self.assertEqual(args.inflight, 3)
+        self.assertEqual(args.mode, "pipeline")
 
     def test_recursive_policy_defaults_to_auto(self):
         args = build_parser().parse_args(
@@ -92,13 +93,14 @@ class CliTests(unittest.TestCase):
             _validate_args(args)
         self.assertIn("skip existing", str(caught.exception))
 
-    def test_resume_is_limited_to_single_file_copies(self):
+    def test_parallel_mode_is_limited_to_single_file_copies(self):
         args = build_parser().parse_args(
             [
                 "--host",
                 "nas.example",
                 "--recursive",
-                "--resume",
+                "--mode",
+                "parallel",
                 "source",
                 "nas:destination",
             ]
@@ -107,7 +109,7 @@ class CliTests(unittest.TestCase):
             _validate_args(args)
         self.assertIn("single-file", str(caught.exception))
 
-    def test_resume_flag_is_routed_to_single_file_upload(self):
+    def test_parallel_mode_is_routed_to_single_file_upload(self):
         api = Mock()
         with patch("nass3cp.cli.ApiClient", return_value=api), patch(
             "nass3cp.cli.upload"
@@ -118,7 +120,8 @@ class CliTests(unittest.TestCase):
                     "nas.example",
                     "--token",
                     "password",
-                    "--resume",
+                    "--mode",
+                    "parallel",
                     "source.bin",
                     "nas:destination.bin",
                 ]
@@ -135,6 +138,13 @@ class CliTests(unittest.TestCase):
             3,
             resume=True,
         )
+
+    def test_resume_flag_is_an_alias_for_parallel_mode(self):
+        args = build_parser().parse_args(
+            ["--host", "nas.example", "--resume", "source.bin", "nas:destination.bin"]
+        )
+        _validate_args(args)
+        self.assertEqual(args.mode, "parallel")
 
     def test_inflight_must_be_in_supported_range(self):
         args = build_parser().parse_args(

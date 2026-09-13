@@ -168,11 +168,17 @@ class _BatchProgress:
 
 
 class _PipelineProgress:
-    def __init__(self, display: _ProgressDisplay, label: str, total: int):
+    def __init__(
+        self,
+        display: _ProgressDisplay,
+        label: str,
+        total: int,
+        completed: int = 0,
+    ):
         self.display = display
         self.label = label
         self.total = total
-        self.completed = 0
+        self.completed = completed
         self.current: Dict[int, int] = {}
         self.sizes: Dict[int, int] = {}
         self._lock = threading.Lock()
@@ -199,6 +205,11 @@ class _PipelineProgress:
             self.completed += size
             completed = self.completed + sum(self.current.values())
         self.display.update(self.label, completed, self.total, force=completed == self.total)
+
+    def abandon(self, index: int) -> None:
+        with self._lock:
+            self.sizes.pop(index, None)
+            self.current.pop(index, None)
 
 
 class _ProgressReader:
@@ -1044,72 +1055,75 @@ def _resumable_upload(
             opened = os.fstat(handle.fileno())
             if _source_identity(opened) != expected_identity:
                 raise Nass3cpError("local source was replaced before it could be uploaded")
-            for group_start in range(0, len(missing), jobs):
-                indexes = missing[group_start : group_start + jobs]
-                payloads: List[bytes] = []
-                items: List[Dict[str, Any]] = []
-                for index in indexes:
-                    handle.seek(index * chunk_size)
-                    expected = _chunk_length(size, chunk_size, index)
-                    data = handle.read(expected)
-                    if len(data) != expected:
-                        raise Nass3cpError("local source became shorter during transfer")
-                    urls = api.urls(transfer_id, index, 1)
-                    if len(urls) != 1 or urls[0].get("index") != index:
-                        raise ProtocolError("server returned the wrong resumable upload URL")
-                    payloads.append(data)
-                    items.append(urls[0])
+            next_missing = 0
+            active: Dict[Any, Tuple[int, bytes, str]] = {}
+            first_error: Optional[BaseException] = None
+            parallel_progress = _PipelineProgress(
+                progress,
+                "upload to S3",
+                size,
+                completed_size,
+            )
+            while next_missing < len(missing) or active:
+                while (
+                    first_error is None
+                    and next_missing < len(missing)
+                    and len(active) < jobs
+                ):
+                    index = missing[next_missing]
+                    next_missing += 1
+                    try:
+                        handle.seek(index * chunk_size)
+                        expected = _chunk_length(size, chunk_size, index)
+                        data = handle.read(expected)
+                        if len(data) != expected:
+                            raise Nass3cpError("local source became shorter during transfer")
+                        urls = api.urls(transfer_id, index, 1)
+                        if len(urls) != 1 or urls[0].get("index") != index:
+                            raise ProtocolError(
+                                "server returned the wrong parallel upload URL"
+                            )
+                        chunk_digest = hashlib.sha256(data).hexdigest()
+                        parallel_progress.register(index, len(data))
+                        future = executor.submit(
+                            _data_request,
+                            "PUT",
+                            urls[0],
+                            data,
+                            progress=None
+                            if quiet
+                            else parallel_progress.callback(index),
+                        )
+                        active[future] = (index, data, chunk_digest)
+                    except BaseException as exc:
+                        first_error = exc
+                        break
 
-                batch_progress = _BatchProgress(
-                    progress,
-                    "upload to S3",
-                    completed_size,
-                    size,
-                    [len(payload) for payload in payloads],
+                if not active:
+                    break
+                finished, _ = wait(
+                    tuple(active),
+                    return_when=FIRST_COMPLETED,
                 )
-                futures = [
-                    executor.submit(
-                        _data_request,
-                        "PUT",
-                        item,
-                        payload,
-                        progress=None if quiet else batch_progress.callback(offset),
-                    )
-                    for offset, (item, payload) in enumerate(zip(items, payloads))
-                ]
-                first_error: Optional[BaseException] = None
-                pending = {
-                    future: (index, payload)
-                    for index, payload, future in zip(indexes, payloads, futures)
-                }
-                while pending:
-                    finished, _ = wait(
-                        tuple(pending),
-                        return_when=FIRST_COMPLETED,
-                    )
-                    changed = False
-                    for future in sorted(finished, key=lambda item: pending[item][0]):
-                        index, payload = pending.pop(future)
-                        try:
-                            future.result()
-                        except BaseException as exc:
-                            if first_error is None:
-                                first_error = exc
-                        else:
-                            completed[index] = hashlib.sha256(payload).hexdigest()
-                            completed_size += len(payload)
-                            changed = True
-                    if changed:
-                        _set_resume_completed(checkpoint, completed)
-                        _save_resume(checkpoint_path, checkpoint)
-                progress.update(
-                    "upload to S3",
-                    completed_size,
-                    size,
-                    force=completed_size == size,
-                )
-                if first_error is not None:
-                    raise first_error
+                changed = False
+                for future in sorted(finished, key=lambda item: active[item][0]):
+                    index, data, chunk_digest = active.pop(future)
+                    try:
+                        future.result()
+                    except BaseException as exc:
+                        parallel_progress.abandon(index)
+                        if first_error is None:
+                            first_error = exc
+                    else:
+                        parallel_progress.finish(index)
+                        completed[index] = chunk_digest
+                        completed_size += len(data)
+                        changed = True
+                if changed:
+                    _set_resume_completed(checkpoint, completed)
+                    _save_resume(checkpoint_path, checkpoint)
+            if first_error is not None:
+                raise first_error
             after = os.fstat(handle.fileno())
             if _source_identity(after) != expected_identity:
                 raise Nass3cpError("local source changed during transfer")
@@ -1586,76 +1600,79 @@ def _resumable_download(
 
             missing = [index for index in range(chunks) if index not in completed]
             with ThreadPoolExecutor(max_workers=jobs) as executor:
-                for group_start in range(0, len(missing), jobs):
-                    indexes = missing[group_start : group_start + jobs]
-                    items: List[Dict[str, Any]] = []
-                    sizes: List[int] = []
-                    for index in indexes:
-                        urls = api.urls(transfer_id, index, 1)
-                        if len(urls) != 1 or urls[0].get("index") != index:
-                            raise ProtocolError(
-                                "server returned the wrong resumable download URL"
-                            )
-                        items.append(urls[0])
-                        sizes.append(_chunk_length(size, chunk_size, index))
-                    batch_progress = _BatchProgress(
-                        progress,
-                        "download from S3",
-                        completed_size,
-                        size,
-                        sizes,
-                    )
-                    futures = [
-                        executor.submit(
-                            _data_request,
-                            "GET",
-                            item,
-                            None,
-                            expected,
-                            progress=None if quiet else batch_progress.callback(offset),
-                        )
-                        for offset, (item, expected) in enumerate(zip(items, sizes))
-                    ]
-                    first_error: Optional[BaseException] = None
-                    pending = {
-                        future: index for index, future in zip(indexes, futures)
-                    }
-                    while pending:
-                        finished, _ = wait(
-                            tuple(pending),
-                            return_when=FIRST_COMPLETED,
-                        )
-                        successful: List[Tuple[int, bytes, str]] = []
-                        for future in sorted(finished, key=lambda item: pending[item]):
-                            index = pending.pop(future)
-                            try:
-                                data = future.result()
-                            except BaseException as exc:
-                                if first_error is None:
-                                    first_error = exc
-                            else:
-                                successful.append(
-                                    (index, data, hashlib.sha256(data).hexdigest())
+                next_missing = 0
+                active: Dict[Any, int] = {}
+                first_error: Optional[BaseException] = None
+                parallel_progress = _PipelineProgress(
+                    progress,
+                    "download from S3",
+                    size,
+                    completed_size,
+                )
+                while next_missing < len(missing) or active:
+                    while (
+                        first_error is None
+                        and next_missing < len(missing)
+                        and len(active) < jobs
+                    ):
+                        index = missing[next_missing]
+                        next_missing += 1
+                        try:
+                            urls = api.urls(transfer_id, index, 1)
+                            if len(urls) != 1 or urls[0].get("index") != index:
+                                raise ProtocolError(
+                                    "server returned the wrong parallel download URL"
                                 )
-                        for index, data, _digest in successful:
-                            handle.seek(index * chunk_size)
-                            handle.write(data)
-                        if successful:
-                            handle.flush()
-                            os.fsync(handle.fileno())
-                            for index, data, chunk_digest in successful:
-                                completed[index] = chunk_digest
-                                completed_size += len(data)
-                            _set_resume_completed(checkpoint, completed)
-                            _save_resume(checkpoint_path, checkpoint)
-                    progress.update(
-                        "download from S3",
-                        completed_size,
-                        size,
-                        force=completed_size == size,
+                            expected = _chunk_length(size, chunk_size, index)
+                            parallel_progress.register(index, expected)
+                            future = executor.submit(
+                                _data_request,
+                                "GET",
+                                urls[0],
+                                None,
+                                expected,
+                                progress=None
+                                if quiet
+                                else parallel_progress.callback(index),
+                            )
+                            active[future] = index
+                        except BaseException as exc:
+                            first_error = exc
+                            break
+
+                    if not active:
+                        break
+                    finished, _ = wait(
+                        tuple(active),
+                        return_when=FIRST_COMPLETED,
                     )
-                    if first_error is not None:
-                        raise first_error
+                    successful: List[Tuple[int, bytes, str]] = []
+                    for future in sorted(finished, key=lambda item: active[item]):
+                        index = active.pop(future)
+                        try:
+                            data = future.result()
+                        except BaseException as exc:
+                            parallel_progress.abandon(index)
+                            if first_error is None:
+                                first_error = exc
+                        else:
+                            successful.append(
+                                (index, data, hashlib.sha256(data).hexdigest())
+                            )
+                    for index, data, _digest in successful:
+                        handle.seek(index * chunk_size)
+                        handle.write(data)
+                    if successful:
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                        for index, data, chunk_digest in successful:
+                            parallel_progress.finish(index)
+                            completed[index] = chunk_digest
+                            completed_size += len(data)
+                        _set_resume_completed(checkpoint, completed)
+                        _save_resume(checkpoint_path, checkpoint)
+                if first_error is not None:
+                    raise first_error
 
             handle.seek(0)
             digest = hashlib.sha256()

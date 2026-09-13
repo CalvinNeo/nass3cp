@@ -388,6 +388,55 @@ class ClientTransferTests(unittest.TestCase):
         self.assertEqual(b"".join(api.objects[index] for index in sorted(api.objects)), content)
         self.assertFalse(api.aborted)
 
+    def test_parallel_upload_refills_workers_without_exceeding_jobs(self):
+        content = b"abcdefghijkl"
+        api = FakeApi()
+        second_started = threading.Event()
+        third_started = threading.Event()
+        concurrency_lock = threading.Lock()
+        active_requests = 0
+        max_active_requests = 0
+        request = fake_data_request(api)
+
+        def delayed_request(method, item, data=None, expected=None, attempts=4, progress=None):
+            nonlocal active_requests, max_active_requests
+            index = int(item["url"].rsplit("/", 1)[1])
+            with concurrency_lock:
+                active_requests += 1
+                max_active_requests = max(max_active_requests, active_requests)
+            try:
+                if index == 1:
+                    second_started.set()
+                    if not third_started.wait(timeout=2.0):
+                        raise ProtocolError("parallel worker pool did not refill")
+                elif index == 0:
+                    if not second_started.wait(timeout=1.0):
+                        raise ProtocolError("second parallel request did not start")
+                elif index == 2:
+                    third_started.set()
+                return request(method, item, data, expected, attempts, progress)
+            finally:
+                with concurrency_lock:
+                    active_requests -= 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.bin"
+            source.write_bytes(content)
+            with patch("nass3cp.client._data_request", side_effect=delayed_request):
+                client.upload(
+                    api,
+                    str(source),
+                    "dest.bin",
+                    False,
+                    2,
+                    60,
+                    True,
+                    resume=True,
+                )
+
+        self.assertTrue(third_started.is_set())
+        self.assertEqual(max_active_requests, 2)
+
     def test_download_verifies_and_atomically_writes_file(self):
         content = b"0123456789"
         api = FakeApi(content)

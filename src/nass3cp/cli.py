@@ -125,11 +125,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="use HTTP over an already-encrypted overlay network or tunnel",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing destination file")
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="retain and resume completed blocks for a single-file copy",
+    transfer_mode = parser.add_mutually_exclusive_group()
+    transfer_mode.add_argument(
+        "--mode",
+        choices=("pipeline", "parallel"),
+        help="block transfer mode: bounded ordered pipeline or resumable parallel (default: pipeline)",
     )
+    transfer_mode.add_argument(
+        "--resume",
+        dest="mode",
+        action="store_const",
+        const="parallel",
+        help="compatibility alias for --mode parallel",
+    )
+    parser.set_defaults(mode="pipeline")
     parser.add_argument(
         "-r",
         "--recursive",
@@ -147,12 +156,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="plan a recursive copy and print statistics without changing files",
     )
-    parser.add_argument("--jobs", type=int, default=2, help="parallel S3 requests (default: 2)")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=2,
+        help="maximum concurrent client-side S3 requests (default: 2)",
+    )
     parser.add_argument(
         "--inflight",
         type=int,
         default=3,
-        help="maximum chunks retained in S3 before receiver acknowledgement (default: 3)",
+        help="pipeline-only maximum chunks retained before receiver acknowledgement (default: 3)",
     )
     parser.add_argument(
         "--transfer-timeout",
@@ -207,15 +221,19 @@ def _validate_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[st
         raise Nass3cpError(
             "--overwrite cannot be combined with --recursive; recursive copies skip existing files"
         )
-    if args.recursive and args.resume:
-        raise Nass3cpError("--resume supports single-file copies and cannot be combined with --recursive")
+    if args.recursive and args.mode == "parallel":
+        raise Nass3cpError(
+            "--mode parallel supports single-file copies and cannot be combined with --recursive"
+        )
     return source_remote, destination_remote
 
 
 def _validate_ls_args(args: argparse.Namespace) -> str:
     _validate_common_args(args)
-    if args.recursive or args.dry or args.resume:
-        raise Nass3cpError("ls cannot be combined with --recursive, --dry, or --resume")
+    if args.recursive or args.dry or args.mode == "parallel":
+        raise Nass3cpError(
+            "ls cannot be combined with --recursive, --dry, or --mode parallel"
+        )
     remote_path = _remote(args.dst)
     if remote_path is None:
         raise Nass3cpError("ls requires one NAS directory prefixed with nas:")
@@ -230,9 +248,9 @@ def _validate_forget_args(args: argparse.Namespace) -> None:
         raise Nass3cpError("--forget-password cannot be combined with --no-saved-password")
     if args.src is not None or args.dst is not None:
         raise Nass3cpError("--forget-password does not accept src or dst")
-    if args.recursive or args.dry or args.resume:
+    if args.recursive or args.dry or args.mode == "parallel":
         raise Nass3cpError(
-            "--forget-password cannot be combined with --recursive, --dry, or --resume"
+            "--forget-password cannot be combined with --recursive, --dry, or --mode parallel"
         )
 
 
@@ -378,7 +396,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.transfer_timeout,
                 args.quiet,
                 args.inflight,
-                resume=args.resume,
+                resume=args.mode == "parallel",
             )
         else:
             download(
@@ -390,7 +408,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 args.transfer_timeout,
                 args.quiet,
                 args.inflight,
-                resume=args.resume,
+                resume=args.mode == "parallel",
             )
     except KeyboardInterrupt:
         print("nass3cp: cancelled", file=sys.stderr)
