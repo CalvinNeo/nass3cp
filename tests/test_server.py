@@ -12,11 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from nass3cp.config import S3Config, ServerConfig
+from nass3cp.config import S3Config, SearchConfig, ServerConfig
 from nass3cp.browse import BrowserServer
 from nass3cp import client, recursive
 from nass3cp.client import ApiClient
-from nass3cp.errors import AuthenticationError
+from nass3cp.errors import AuthenticationError, ProtocolError
 from nass3cp.s3 import PresignedRequest
 from nass3cp.server import (
     ApiError,
@@ -100,6 +100,7 @@ class ServerTransferTests(unittest.TestCase):
         self.app.start_worker = lambda function, *args: None
 
     def tearDown(self):
+        self.app.stop()
         self.temporary.cleanup()
 
     def wait_until(self, predicate, timeout=5):
@@ -479,6 +480,37 @@ class ServerTransferTests(unittest.TestCase):
             nas.shutdown()
             nas.server_close()
             nas_thread.join(timeout=5)
+
+    def test_search_http_api_auth_progress_cancel_and_boundaries_without_s3(self):
+        (self.root / "subfolder").mkdir()
+        (self.root / "subfolder" / "中文报告.pdf").write_bytes(b"report")
+        server = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base_url = "http://127.0.0.1:%d" % server.server_port
+        api = ApiClient(base_url, "password", timeout=5)
+        try:
+            with mock.patch.object(self.app, "s3") as s3:
+                with self.assertRaises(AuthenticationError):
+                    ApiClient(base_url, "wrong").start_search(".", "报告")
+                self.assertIsNone(self.app.searches._active)
+                with self.assertRaises(ProtocolError):
+                    api.start_search(str(self.base), "报告")
+                search = api.start_search(".", r"报告\.pdf$", regex=True)
+                api.check_authenticated()
+                self.wait_until(lambda: api.search_state(search["id"])["status"] == "completed")
+                result = api.search_state(search["id"])
+                self.assertEqual(result["results"][0]["relative_path"], "subfolder/中文报告.pdf")
+                self.assertEqual(result["estimated_percent"], 100)
+                self.app.searches.settings = SearchConfig(entries_per_second=1)
+                search = api.start_search(".", "报告")
+                api.cancel_search(search["id"])
+                self.wait_until(lambda: api.search_state(search["id"])["status"] == "cancelled")
+                self.assertFalse(s3.mock_calls)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_path_info_and_recursive_directory_creation(self):
         self.assertEqual(self.app.path_info({"path": "missing"}), {"exists": False})

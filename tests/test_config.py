@@ -6,12 +6,21 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from nass3cp.config import load_environment_file, load_server_config
+from nass3cp.config import SearchConfig, _load_search, load_environment_file, load_server_config
 from nass3cp.errors import ConfigError
 from nass3cp.server import validate_server_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_search_settings_have_conservative_defaults_and_validate_limits(self):
+        self.assertEqual(_load_search({}), SearchConfig())
+        self.assertEqual(_load_search({"entries_per_second": 12}).entries_per_second, 12)
+        for invalid in (None, [], {"entries_per_second": 0}, {"entries_per_second": True},
+                        {"entries_per_second": 1.5}, {"entries_per_second": 10001},
+                        {"max_results": -1}, {"max_results": 10001}, {"regex_timeout_ms": 0}):
+            with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
+                _load_search(invalid)
+
     def test_aliyun_example_is_parseable(self):
         filename = Path(__file__).resolve().parents[1] / "examples" / "server.aliyun.json"
         with patch.dict(
@@ -116,6 +125,7 @@ class ConfigTests(unittest.TestCase):
             ):
                 config = load_server_config(str(filename))
             self.assertEqual(config.s3.access_key_id, "access")
+            self.assertEqual(config.search, SearchConfig())
             self.assertEqual(config.state_dir, (base / "state").resolve())
             self.assertNotEqual(config.auth_password_sha256, "password")
 

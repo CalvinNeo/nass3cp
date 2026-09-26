@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.parse import urlsplit
@@ -127,6 +127,29 @@ class S3Config:
 
 
 @dataclass(frozen=True)
+class SearchConfig:
+    entries_per_second: int = 50
+    max_results: int = 1000
+    regex_timeout_ms: int = 100
+
+
+def _load_search(raw: Any) -> SearchConfig:
+    if not isinstance(raw, dict):
+        raise ConfigError("search must be an object")
+    values = {}
+    for name, default, maximum in (
+        ("entries_per_second", 50, 10000),
+        ("max_results", 1000, 10000),
+        ("regex_timeout_ms", 100, 5000),
+    ):
+        value = raw.get(name, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+            raise ConfigError("search.%s must be an integer between 1 and %d" % (name, maximum))
+        values[name] = value
+    return SearchConfig(**values)
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     listen: str
     port: int
@@ -140,6 +163,7 @@ class ServerConfig:
     transfer_ttl_seconds: int
     max_file_size: int
     s3: S3Config
+    search: SearchConfig = field(default_factory=SearchConfig)
 
 
 def _load_s3(raw: Mapping[str, Any]) -> S3Config:
@@ -309,4 +333,5 @@ def load_server_config(filename: str) -> ServerConfig:
         transfer_ttl_seconds=_positive_int(raw, "transfer_ttl_seconds", 24 * 3600),
         max_file_size=_positive_int(raw, "max_file_size", 1024 * 1024 * 1024 * 1024),
         s3=_load_s3(_require(raw, "s3", dict)),
+        search=_load_search(raw.get("search", {})),
     )

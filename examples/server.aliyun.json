@@ -16,6 +16,11 @@
   "chunk_size": 67108864,
   "transfer_ttl_seconds": 86400,
   "max_file_size": 1099511627776,
+  "search": {
+    "entries_per_second": 50,
+    "max_results": 1000,
+    "regex_timeout_ms": 100
+  },
   "s3": {
     "endpoint": "https://s3.oss-cn-hangzhou.aliyuncs.com",
     "region": "cn-hangzhou",

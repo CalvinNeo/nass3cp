@@ -1,5 +1,6 @@
 import http.client
 import io
+import json
 import threading
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -36,12 +37,12 @@ class BrowserTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join(timeout=5)
 
-    def request(self, path="/", headers=None, method="GET"):
+    def request(self, path="/", headers=None, method="GET", body=None):
         request_headers = {"Cookie": self.cookie}
         request_headers.update(headers or {})
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
         try:
-            connection.request(method, path, headers=request_headers)
+            connection.request(method, path, body=body, headers=request_headers)
             response = connection.getresponse()
             return response.status, dict(response.getheaders()), response.read().decode("utf-8")
         finally:
@@ -96,13 +97,13 @@ class BrowserTests(unittest.TestCase):
         self.assertNotIn("<img", body)
         expected_query = urlencode({"path": "/share/中文 & # + ?", "cursor": 0})
         self.assertIn(("/?" + expected_query).replace("&", "&amp;"), body)
-        self.assertIn("创建时间", body)
+        self.assertIn("Created", body)
         self.assertIn("2.0 KiB", body)
-        self.assertIn("2,048 字节", body)
+        self.assertIn("2,048 bytes", body)
         self.assertIn("0 B", body)
-        self.assertIn("不可用", body)
+        self.assertIn("N/A", body)
         self.assertIn("2020-09", body)
-        self.assertIn("符号链接", body)
+        self.assertIn("Symbolic link", body)
         self.assertNotIn("path=%2Fshare%2Flink", body)
         self.assertIn('aria-disabled="true"', body)
         self.assertIn("path=%2Fother", body)
@@ -119,7 +120,7 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.api.list_directory.assert_called_once_with(path, 0, PAGE_SIZE)
         self.assertIn("path=C%3A%2Fshare", body)
-        self.assertIn("此文件夹为空", body)
+        self.assertIn("This folder is empty", body)
         self.assertIn("\\udcff", body)
 
     def test_pagination_fetches_only_the_requested_page(self):
@@ -130,10 +131,10 @@ class BrowserTests(unittest.TestCase):
         self.login()
         status, _, body = self.request("/?path=nas%3A%2Fshare&cursor=100")
         self.assertEqual(status, 200)
-        self.assertIn("共 201 项", body)
-        self.assertIn("显示 101–200 项", body)
+        self.assertIn("Total: 201", body)
+        self.assertIn("Showing 101–200", body)
         self.assertIn("cursor=200", body)
-        self.assertIn("上一页", body)
+        self.assertIn("Previous", body)
         self.api.list_directory.assert_called_once_with("/share", 100, PAGE_SIZE)
 
     def test_legacy_directory_responses_work_without_new_metadata(self):
@@ -144,8 +145,8 @@ class BrowserTests(unittest.TestCase):
         self.login()
         status, _, body = self.request("/?path=folder")
         self.assertEqual(status, 200)
-        self.assertIn("本页 1 项", body)
-        self.assertIn("不可用", body)
+        self.assertIn("Items on this page: 1", body)
+        self.assertIn("N/A", body)
         self.assertIn("path=.", body)
 
     def test_remote_errors_are_visible_and_escaped_and_refresh_can_recover(self):
@@ -154,8 +155,8 @@ class BrowserTests(unittest.TestCase):
             self.api.list_directory.side_effect = error
             status, _, body = self.request()
             self.assertEqual(status, 502)
-            self.assertIn("无法读取目录", body)
-            self.assertIn("刷新", body)
+            self.assertIn("Unable to read folder", body)
+            self.assertIn("Refresh", body)
             self.assertNotIn("<script>", body)
         self.api.list_directory.side_effect = None
         self.assertEqual(self.request()[0], 200)
@@ -166,7 +167,7 @@ class BrowserTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(self.request(path)[0], 400)
         self.assertEqual(self.request("/etc/passwd")[0], 404)
-        self.assertEqual(self.request("/v1/transfers/upload", method="POST")[0], 501)
+        self.assertEqual(self.request("/v1/transfers/upload", method="POST")[0], 403)
         self.assertEqual(self.api.mock_calls, [])
 
     def test_stylesheet_is_served_without_reading_local_paths_or_nas(self):
@@ -177,6 +178,37 @@ class BrowserTests(unittest.TestCase):
         self.assertIn("@media", body)
         self.api.list_directory.assert_not_called()
 
+    def test_search_proxy_requires_session_and_same_origin_json_requests(self):
+        identifier = "a" * 32
+        body = json.dumps({"path": "/share", "pattern": "报告.*", "regex": True})
+        headers = {"Content-Type": "application/json", "X-Nass3cp-Request": "search"}
+        self.api.start_search.return_value = {"id": identifier, "status": "running", "results": []}
+        self.assertEqual(self.request("/api/searches", headers, "POST", body)[0], 403)
+        self.login()
+        self.assertEqual(self.request("/api/searches", {}, "POST", body)[0], 403)
+        foreign = dict(headers, Origin="https://attacker.test")
+        self.assertEqual(self.request("/api/searches", foreign, "POST", body)[0], 403)
+        self.api.start_search.assert_not_called()
+        status, _, value = self.request("/api/searches", headers, "POST", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(value)["id"], identifier)
+        self.api.start_search.assert_called_once_with("/share", "报告.*", True, False)
+        self.api.search_state.return_value = {"id": identifier, "status": "completed", "results": []}
+        self.assertEqual(self.request("/api/searches/" + identifier + "?cursor=100")[0], 200)
+        self.api.search_state.assert_called_once_with(identifier, 100)
+        self.assertEqual(self.request("/api/searches/" + "b" * 32)[0], 404)
+        self.api.cancel_search.return_value = {"id": identifier, "status": "completed", "results": []}
+        self.assertEqual(self.request("/api/searches/" + identifier + "/cancel", headers, "POST", "{}")[0], 200)
+        self.api.cancel_search.assert_called_once_with(identifier)
+
+    def test_search_script_and_headers_allow_only_local_script_and_requests(self):
+        self.login()
+        status, headers, body = self.request("/browse.js")
+        self.assertEqual(status, 200)
+        self.assertIn("script-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("connect-src 'self'", headers["Content-Security-Policy"])
+        self.assertIn("Estimated progress", body)
+        self.assertIn("sessionStorage", body)
 
 class BrowserLifecycleTests(unittest.TestCase):
     def test_startup_failure_does_not_listen_or_open_browser(self):

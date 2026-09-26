@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import stat
 import ssl
 import sys
@@ -367,6 +368,33 @@ class ApiClient:
             "/v1/list",
             {"path": path, "cursor": cursor, "limit": limit},
         )
+
+    def start_search(self, path: str, pattern: str, regex: bool = False,
+                     case_sensitive: bool = False) -> Dict[str, Any]:
+        try:
+            return self.request("POST", "/v1/searches", {
+                "path": path, "pattern": pattern, "regex": regex, "case_sensitive": case_sensitive,
+            })
+        except ProtocolError as exc:
+            if isinstance(exc.__cause__, HTTPError) and exc.__cause__.code == 404:
+                raise ProtocolError("This NAS server does not support file search. Update and restart nass3cp-server.") from exc
+            raise
+
+    @staticmethod
+    def _search_id(identifier: str) -> str:
+        if not isinstance(identifier, str) or not re.fullmatch(r"[0-9a-f]{32}", identifier):
+            raise ProtocolError("invalid search identifier")
+        return identifier
+
+    def search_state(self, identifier: str, cursor: int = 0) -> Dict[str, Any]:
+        if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+            raise ValueError("invalid search result cursor")
+        return self.request("GET", "/v1/searches/%s?cursor=%d&limit=100" % (
+            self._search_id(identifier), cursor,
+        ))
+
+    def cancel_search(self, identifier: str) -> Dict[str, Any]:
+        return self.request("POST", "/v1/searches/%s/cancel" % self._search_id(identifier), {})
 
     def path_info(self, path: str) -> Dict[str, Any]:
         value = self.request("POST", "/v1/path-info", {"path": path})

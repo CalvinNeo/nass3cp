@@ -293,6 +293,20 @@ class ClientTransferTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             client.ApiClient("http://127.0.0.1:9443", "password", insecure=True)
 
+    def test_search_api_keeps_unicode_and_validates_identifiers(self):
+        api = client.ApiClient("http://127.0.0.1:1234", "password")
+        with patch.object(api, "request", return_value={}) as request:
+            api.start_search("/共享", r"报告.*\.pdf$", regex=True)
+            request.assert_called_once_with("POST", "/v1/searches", {
+                "path": "/共享", "pattern": r"报告.*\.pdf$", "regex": True, "case_sensitive": False,
+            })
+            request.reset_mock()
+            with self.assertRaises(ProtocolError):
+                api.cancel_search("../transfers/upload")
+            with self.assertRaises(ValueError):
+                api.search_state("a" * 32, -1)
+            request.assert_not_called()
+
     def test_list_remote_collects_validated_pages(self):
         api = ListApi()
 

@@ -1,37 +1,71 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>文件浏览 · nass3cp</title>
+  <title>File browser · nass3cp</title>
   <link rel="stylesheet" href="/browse.css">
+  <script src="/browse.js" defer></script>
 </head>
 <body>
   <header class="app-header">
     <div class="brand"><span class="brand-mark" aria-hidden="true">n</span> nass3cp</div>
-    <span class="local-badge"><span aria-hidden="true">●</span> 本机会话</span>
+    <span class="local-badge"><span aria-hidden="true">●</span> Local session</span>
   </header>
   <main>
     <div class="heading">
-      <div><p class="eyebrow">NAS 文件</p><h1>文件浏览</h1><p class="intro">浏览目录，查看文件的基本信息。</p></div>
-      <div class="connection"><span>已连接到</span><code>$endpoint</code></div>
+      <div><p class="eyebrow">NAS FILES</p><h1>File browser</h1><p class="intro">Browse folders and view file details.</p></div>
+      <div class="connection"><span>Connected to</span><code>$endpoint</code></div>
     </div>
     $roots
-    <section class="explorer" aria-label="文件浏览器">
+    <section class="explorer" aria-label="File browser">
       <div class="toolbar">
-        <nav class="actions" aria-label="目录导航">$navigation</nav>
+        <nav class="actions" aria-label="Folder navigation">$navigation</nav>
         <form action="/" method="get" class="path-form">
-          <label class="sr-only" for="path">NAS 目录路径</label>
-          <input id="path" name="path" value="$path" placeholder="nas:/目录路径" autocomplete="off" spellcheck="false">
-          <button type="submit">前往</button>
+          <label class="sr-only" for="path">NAS folder path</label>
+          <input id="path" name="path" value="$path" placeholder="nas:/path/to/folder" autocomplete="off" spellcheck="false">
+          <button type="submit">Go</button>
         </form>
       </div>
-      <div class="current-path"><span>当前位置</span><bdi>$path</bdi></div>
-      $content
-      <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="分页">$pagination</nav></footer>
+      <div class="current-path"><span>Current folder</span><bdi>$path</bdi></div>
+      <section class="search-panel" aria-label="File search">
+        <form id="search-form" data-path="$path">
+          <label for="search-pattern">Search files</label>
+          <div class="search-inputs">
+            <input id="search-pattern" name="pattern" type="search" required maxlength="512" placeholder="File name or regular expression" autocomplete="off" spellcheck="false">
+            <button id="search-start" type="submit">Search</button>
+            <button id="search-cancel" type="button" disabled>Cancel</button>
+          </div>
+          <div class="search-options">
+            <label><input id="search-regex" type="checkbox"> Regular expression</label>
+            <label><input id="search-case" type="checkbox"> Case sensitive</label>
+            <span>Searches file names in this folder and all subfolders. Supports Unicode.</span>
+          </div>
+        </form>
+        <div id="search-progress" hidden>
+          <div class="search-summary"><strong id="search-status" role="status" aria-live="polite"></strong><button id="search-close" type="button">Back to folder</button></div>
+          <progress id="search-bar" max="100" aria-label="Estimated search progress"></progress>
+          <p id="search-counts"></p>
+          <p id="search-estimate" class="note"></p>
+          <p id="search-current" class="note"></p>
+          <p id="search-error" role="alert" hidden></p>
+        </div>
+        <noscript>Enable JavaScript to search files and view live progress.</noscript>
+      </section>
+      <section id="search-results" aria-label="Search results" hidden>
+        <div class="table-scroll"><table>
+          <thead><tr><th scope="col">Name / Location</th><th scope="col" class="size">Size</th><th scope="col">Created</th><th scope="col">Modified</th></tr></thead>
+          <tbody id="search-rows"></tbody>
+        </table></div>
+        <p id="search-empty" class="empty">Waiting for results…</p>
+      </section>
+      <div id="directory-view">
+        $content
+        <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="Pagination">$pagination</nav></footer>
+      </div>
     </section>
-    <p class="note">时间按本机时区显示；无法获取创建时间时显示“不可用”。目录大小不做递归统计。</p>
-    <p class="note">当前支持列表浏览；图片与视频暂不提供缩略图或预览。</p>
+    <p class="note">Times are shown in your local time zone. Unavailable creation times are shown as N/A. Folder sizes are not calculated.</p>
+    <p class="note">List view only. Image and video thumbnails and previews are not yet available.</p>
   </main>
 </body>
 </html>

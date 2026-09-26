@@ -24,6 +24,8 @@ from . import __version__
 from .compression import DecodingWriter, gzip_compress_stream
 from .config import ServerConfig, load_environment_file, load_server_config
 from .errors import ConfigError, Nass3cpError, S3Error
+from .metadata import birthtime_ns as _birthtime_ns
+from .search import SearchError, SearchManager
 from .s3 import S3Relay
 
 
@@ -193,21 +195,6 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
-def _birthtime_ns(details: os.stat_result) -> Optional[int]:
-    """Return creation time only when the platform actually exposes it."""
-    value = getattr(details, "st_birthtime_ns", None)
-    if value is not None:
-        return int(value)
-    value = getattr(details, "st_birthtime", None)
-    if value is not None:
-        return int(value * 1_000_000_000)
-    # Before Python 3.12, Windows exposes creation time as st_ctime.
-    # On Unix st_ctime is a metadata change time, never a creation time.
-    if os.name == "nt":
-        return details.st_ctime_ns
-    return None
-
-
 class ServerApp:
     def __init__(self, config: ServerConfig):
         self.config = config
@@ -215,6 +202,7 @@ class ServerApp:
         self.store = TransferStore(config.state_dir)
         self._stop = threading.Event()
         self._pipeline_condition = threading.Condition()
+        self.searches = SearchManager(config.search, self.resolve_remote_directory)
 
     def validate(self) -> None:
         validate_server_config(self.config)
@@ -1634,6 +1622,7 @@ class ServerApp:
 
     def stop(self) -> None:
         self._stop.set()
+        self.searches.stop()
 
 
 class Nass3cpHTTPServer(ThreadingHTTPServer):
@@ -1709,6 +1698,16 @@ class RequestHandler(BaseHTTPRequestHandler):
             if parsed.path == "/v1/health":
                 self._send_json(HTTPStatus.OK, {"status": "ok", "version": __version__})
                 return
+            match = re.fullmatch(r"/v1/searches/([0-9a-f]{32})", parsed.path)
+            if match:
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                try:
+                    cursor = int(query.get("cursor", ["0"])[0])
+                    limit = int(query.get("limit", ["100"])[0])
+                except ValueError as exc:
+                    raise ApiError(400, "invalid_request", "cursor and limit must be integers") from exc
+                self._send_json(200, self.app.searches.state(match.group(1), cursor, limit))
+                return
             match = re.fullmatch(r"/v1/transfers/([0-9a-f]{32})", parsed.path)
             if match:
                 self._send_json(HTTPStatus.OK, _public_state(self.app.store.get(match.group(1))))
@@ -1724,7 +1723,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.OK, self.app.urls(match.group(1), start, count))
                 return
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
-        except ApiError as exc:
+        except (ApiError, SearchError) as exc:
             self._error(exc)
         except Exception:
             LOG.exception("unhandled GET error")
@@ -1736,6 +1735,13 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             path = urlsplit(self.path).path
             body = self._body()
+            if path == "/v1/searches":
+                self._send_json(202, self.app.searches.start(body))
+                return
+            search_match = re.fullmatch(r"/v1/searches/([0-9a-f]{32})/cancel", path)
+            if search_match:
+                self._send_json(200, self.app.searches.cancel(search_match.group(1)))
+                return
             if path == "/v1/list":
                 self._send_json(HTTPStatus.OK, self.app.list_directory(body))
                 return
@@ -1782,7 +1788,7 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self._send_json(HTTPStatus.ACCEPTED, _public_state(state))
                 return
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
-        except ApiError as exc:
+        except (ApiError, SearchError) as exc:
             self._error(exc)
         except Exception:
             LOG.exception("unhandled POST error")
