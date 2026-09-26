@@ -19,7 +19,10 @@
   "search": {
     "entries_per_second": 50,
     "max_results": 1000,
-    "regex_timeout_ms": 100
+    "regex_timeout_ms": 100,
+    "batch_size": 200,
+    "max_pending_dirs": 2048,
+    "exclude_dirs": []
   },
   "s3": {
     "endpoint": "https://replace-with-account-id.r2.cloudflarestorage.com",

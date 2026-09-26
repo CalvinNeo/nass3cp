@@ -15,9 +15,20 @@ class ConfigTests(unittest.TestCase):
     def test_search_settings_have_conservative_defaults_and_validate_limits(self):
         self.assertEqual(_load_search({}), SearchConfig())
         self.assertEqual(_load_search({"entries_per_second": 12}).entries_per_second, 12)
+        configured = _load_search({"batch_size": 25, "max_pending_dirs": 10,
+                                   "exclude_dirs": ["node_modules", "缓存", "缓存"]})
+        self.assertEqual(configured.batch_size, 25)
+        self.assertEqual(configured.max_pending_dirs, 10)
+        self.assertEqual(configured.exclude_dirs, ("node_modules", "缓存"))
         for invalid in (None, [], {"entries_per_second": 0}, {"entries_per_second": True},
                         {"entries_per_second": 1.5}, {"entries_per_second": 10001},
-                        {"max_results": -1}, {"max_results": 10001}, {"regex_timeout_ms": 0}):
+                        {"max_results": -1}, {"max_results": 10001}, {"regex_timeout_ms": 0},
+                        {"batch_size": 0}, {"batch_size": True}, {"batch_size": 10001},
+                        {"max_pending_dirs": 0}, {"max_pending_dirs": 16385},
+                        {"exclude_dirs": "node_modules"}, {"exclude_dirs": [None]},
+                        {"exclude_dirs": [""]}, {"exclude_dirs": ["."]},
+                        {"exclude_dirs": ["a/b"]}, {"exclude_dirs": ["a\\b"]},
+                        {"exclude_dirs": ["a\x00"]}, {"exclude_dirs": ["a"] * 257}):
             with self.subTest(invalid=invalid), self.assertRaises(ConfigError):
                 _load_search(invalid)
 

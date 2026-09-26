@@ -10,6 +10,9 @@
   const bar = document.getElementById("search-bar");
   const status = document.getElementById("search-status");
   const counts = document.getElementById("search-counts");
+  const percent = document.getElementById("search-percent");
+  const scope = document.getElementById("search-scope");
+  const traversal = document.getElementById("search-traversal");
   const estimate = document.getElementById("search-estimate");
   const current = document.getElementById("search-current");
   const error = document.getElementById("search-error");
@@ -99,16 +102,26 @@
       completed: "Search completed", cancelled: "Search cancelled", limited: "Result limit reached", failed: "Search failed"};
     status.textContent = labels[data.status] || data.status;
     const running = active.has(data.status);
-    counts.textContent = data.scanned_entries.toLocaleString("en-US") + " entries scanned · " +
-      data.directories_completed + "/" + data.directories_discovered + " discovered folders completed · " +
-      data.results_count + " matches · " + data.elapsed_seconds + " s elapsed · Limit: " + data.rate_limit + " entries/s";
-    if (data.skipped_entries) counts.textContent += " · " + data.skipped_entries + " entries skipped (unreadable, links or unsupported)";
+    counts.textContent = data.scanned_entries.toLocaleString("en-US") + " scanned · " +
+      data.results_count + " matches · " + data.directories_completed + "/" + data.directories_discovered +
+      " folders done · " + data.elapsed_seconds + " s · Limit " + data.rate_limit + "/s";
+    if (data.skipped_entries) counts.textContent += " · " + data.skipped_entries + " skipped";
+    const excluded = data.exclude_dirs || [];
+    scope.textContent = excluded.length ? "Excluded folders: " + excluded.join(", ") +
+      " · " + (data.excluded_directories || 0) + " skipped" : "";
+    scope.hidden = !excluded.length;
+    traversal.textContent = (data.queued_directories || 0) + " folders queued. " +
+      (data.skipped_entries || 0) + " entries skipped (unreadable, links, too deep or unsupported).";
+    if (data.depth_first_directories) traversal.textContent += " " + data.depth_first_directories +
+      " folders used depth-first scanning to keep the queue bounded; no folders were dropped because of the queue limit.";
     if (data.estimated_percent === null) {
       bar.removeAttribute("value");
+      percent.textContent = "—";
       estimate.textContent = running ? "Discovering folders. The total size of the search is not known yet." :
         "Search stopped before enough folders were scanned to estimate progress.";
     } else {
       bar.value = data.estimated_percent;
+      percent.textContent = (data.status === "completed" ? "" : "~") + data.estimated_percent + "%";
       estimate.textContent = data.status === "completed" ? "Finished scanning accessible files." :
         "Estimated progress: " + data.estimated_percent + "%. Based on observed folder sizes; may change as more folders are discovered.";
     }
@@ -165,6 +178,9 @@
     close.disabled = true;
     status.textContent = "Starting search…";
     counts.textContent = estimate.textContent = current.textContent = "";
+    percent.textContent = "—";
+    scope.hidden = true;
+    scope.textContent = traversal.textContent = "";
     bar.removeAttribute("value");
     showError("");
     try {

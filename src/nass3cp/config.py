@@ -4,7 +4,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit
 
 from .errors import ConfigError
@@ -131,6 +131,9 @@ class SearchConfig:
     entries_per_second: int = 50
     max_results: int = 1000
     regex_timeout_ms: int = 100
+    batch_size: int = 200
+    max_pending_dirs: int = 2048
+    exclude_dirs: Tuple[str, ...] = ()
 
 
 def _load_search(raw: Any) -> SearchConfig:
@@ -141,11 +144,21 @@ def _load_search(raw: Any) -> SearchConfig:
         ("entries_per_second", 50, 10000),
         ("max_results", 1000, 10000),
         ("regex_timeout_ms", 100, 5000),
+        ("batch_size", 200, 10000),
+        ("max_pending_dirs", 2048, 16384),
     ):
         value = raw.get(name, default)
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
             raise ConfigError("search.%s must be an integer between 1 and %d" % (name, maximum))
         values[name] = value
+    excluded = raw.get("exclude_dirs", [])
+    if not isinstance(excluded, list) or len(excluded) > 256:
+        raise ConfigError("search.exclude_dirs must be a list of up to 256 folder names")
+    for name in excluded:
+        if (not isinstance(name, str) or not 1 <= len(name) <= 255 or name in (".", "..")
+                or any(character in name for character in ("/", "\\", "\x00"))):
+            raise ConfigError("search.exclude_dirs must contain folder names, not paths or patterns")
+    values["exclude_dirs"] = tuple(dict.fromkeys(excluded))
     return SearchConfig(**values)
 
 

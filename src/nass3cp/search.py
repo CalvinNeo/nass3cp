@@ -1,5 +1,6 @@
 """Bounded, cancellable filename searches in an isolated worker process."""
 
+import heapq
 import multiprocessing
 import os
 import re
@@ -7,6 +8,8 @@ import secrets
 import stat
 import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -18,6 +21,7 @@ from .metadata import birthtime_ns
 ACTIVE_STATUSES = ("starting", "running", "cancelling")
 MAX_PATTERN_LENGTH = 512
 MAX_DEPTH = 128
+MAX_ACTIVE_DIRECTORIES = 16
 
 
 class SearchError(Nass3cpError):
@@ -45,6 +49,8 @@ def _counters(path: str) -> Dict[str, Any]:
     return {
         "scanned_entries": 0, "scanned_files": 0, "directories_discovered": 1,
         "directories_completed": 0, "completed_directory_entries": 0,
+        "directories_skipped": 0, "excluded_directories": 0,
+        "queued_directories": 0, "open_directories": 0, "depth_first_directories": 0,
         "skipped_entries": 0, "current_path": path,
     }
 
@@ -54,11 +60,143 @@ def _is_link(details: os.stat_result) -> bool:
     return stat.S_ISLNK(details.st_mode) or bool(getattr(details, "st_file_attributes", 0) & 0x400)
 
 
+@dataclass(eq=False)
+class _Directory:
+    path: Path
+    depth: int
+    iterator: Any = None
+    entries: int = 0
+
+
+class _Walker:
+    """Rotate directory batches, admitting shallow queued folders first.
+
+    Iterators stay open across turns. Queue pressure uses a local DFS stack
+    bounded by MAX_DEPTH, in addition to the normal active directory window.
+    """
+
+    def __init__(self, root: Path, settings: SearchConfig, stats: Dict[str, Any],
+                 pacer: _Pacer, progress: Callable[[], None]):
+        self.root, self.settings, self.stats = root, settings, stats
+        self.pacer, self.progress = pacer, progress
+        self.pending = []  # type: list
+        self.ready = deque()  # type: deque
+        self.opened = set()  # type: set
+        self.sequence = 0
+        self.excluded = set(settings.exclude_dirs)
+        self._enqueue(_Directory(root, 0))
+
+    def _enqueue(self, directory: _Directory) -> None:
+        self.sequence += 1
+        heapq.heappush(self.pending, (directory.depth, self.sequence, directory))
+        self.stats["queued_directories"] = len(self.pending)
+
+    def _open(self, directory: _Directory) -> bool:
+        self.pacer.wait()
+        try:
+            details = directory.path.lstat()
+            directory.path.relative_to(self.root)
+            if (_is_link(details) or directory.path.resolve() != directory.path
+                    or not stat.S_ISDIR(details.st_mode)):
+                raise OSError("directory changed or is a symbolic link")
+            directory.iterator = os.scandir(str(directory.path))
+        except (OSError, ValueError):
+            if directory.depth == 0:
+                raise
+            self.stats["skipped_entries"] += 1
+            self.stats["directories_skipped"] += 1
+            return False
+        self.opened.add(directory)
+        self.stats["open_directories"] = len(self.opened)
+        return True
+
+    def _close(self, directory: _Directory) -> None:
+        directory.iterator.close()
+        directory.iterator = None
+        self.opened.remove(directory)
+        self.stats["open_directories"] = len(self.opened)
+
+    def _admit(self) -> None:
+        while self.pending and len(self.opened) < MAX_ACTIVE_DIRECTORIES:
+            _, _, directory = heapq.heappop(self.pending)
+            self.stats["queued_directories"] = len(self.pending)
+            if self._open(directory):
+                self.ready.append(directory)
+            self.progress()
+
+    def _batch(self, directory: _Directory, depth_first: bool = False):
+        processed = 0
+        while directory.iterator is not None and (depth_first or processed < self.settings.batch_size):
+            self.stats["current_path"] = directory.path.as_posix()
+            self.progress()
+            self.pacer.wait()
+            try:
+                entry = next(directory.iterator)
+            except StopIteration:
+                self.stats["directories_completed"] += 1
+                self.stats["completed_directory_entries"] += directory.entries
+                self._close(directory)
+                self.progress()
+                return
+            except OSError:
+                self.stats["skipped_entries"] += 1
+                self.stats["directories_skipped"] += 1
+                self._close(directory)
+                return
+            processed += 1
+            directory.entries += 1
+            self.stats["scanned_entries"] += 1
+            try:
+                if entry.is_symlink():
+                    self.stats["skipped_entries"] += 1
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if entry.name in self.excluded:
+                        self.stats["excluded_directories"] += 1
+                        continue
+                    if directory.depth + 1 >= MAX_DEPTH:
+                        self.stats["skipped_entries"] += 1
+                        continue
+                    child = _Directory(Path(entry.path), directory.depth + 1)
+                    self.stats["directories_discovered"] += 1
+                    if depth_first or len(self.pending) >= self.settings.max_pending_dirs:
+                        self.stats["depth_first_directories"] += 1
+                        if self._open(child):
+                            yield from self._batch(child, depth_first=True)
+                    else:
+                        self._enqueue(child)
+                    continue
+                yield directory.path, entry
+            except (OSError, ValueError):
+                self.stats["skipped_entries"] += 1
+
+    def __iter__(self):
+        try:
+            self._admit()
+            while self.ready:
+                directory = self.ready.popleft()
+                yield from self._batch(directory)
+                # Newly discovered shallow folders get a turn before this
+                # directory's next batch. Never reopen/rescan paused iterators.
+                self._admit()
+                if directory.iterator is not None:
+                    self.ready.append(directory)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        for directory in list(self.opened):
+            self._close(directory)
+        self.pending.clear()
+        self.ready.clear()
+        self.stats["queued_directories"] = 0
+
+
 def _search_worker(connection: Any, root_name: str, pattern: str, regex: bool,
                    case_sensitive: bool, settings: SearchConfig) -> None:
     root = Path(root_name)
     stats = _counters(root.as_posix())
-    stack = []
+    walker = None
     pacer = _Pacer(settings.entries_per_second)
     last_update = 0.0
     found = 0
@@ -68,13 +206,9 @@ def _search_worker(connection: Any, root_name: str, pattern: str, regex: bool,
         connection.send(dict(values, phase=phase, stats=dict(stats)))
         last_update = time.monotonic()
 
-    def open_directory(directory: Path) -> None:
-        pacer.wait()
-        details = directory.lstat()
-        directory.relative_to(root)
-        if _is_link(details) or directory.resolve() != directory or not stat.S_ISDIR(details.st_mode):
-            raise OSError("directory changed or is a symbolic link")
-        stack.append([directory, os.scandir(str(directory)), 0])
+    def progress() -> None:
+        if time.monotonic() - last_update >= 0.25:
+            emit()
 
     try:
         if hasattr(os, "nice"):
@@ -88,41 +222,10 @@ def _search_worker(connection: Any, root_name: str, pattern: str, regex: bool,
             matcher = re.compile(pattern, 0 if case_sensitive else re.IGNORECASE)
             emit()
         needle = pattern if case_sensitive else pattern.casefold()
-        open_directory(root)
+        walker = _Walker(root, settings, stats, pacer, progress)
         emit()
-        while stack:
-            directory, iterator, _ = stack[-1]
-            stats["current_path"] = directory.as_posix()
-            if time.monotonic() - last_update >= 0.25:
-                emit()
-            pacer.wait()
+        for directory, entry in walker:
             try:
-                entry = next(iterator)
-            except StopIteration:
-                stats["directories_completed"] += 1
-                stats["completed_directory_entries"] += stack[-1][2]
-                iterator.close()
-                stack.pop()
-                emit()
-                continue
-            except OSError:
-                stats["skipped_entries"] += 1
-                iterator.close()
-                stack.pop()
-                continue
-            stats["scanned_entries"] += 1
-            stack[-1][2] += 1
-            try:
-                if entry.is_symlink():
-                    stats["skipped_entries"] += 1
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    if len(stack) >= MAX_DEPTH:
-                        stats["skipped_entries"] += 1
-                        continue
-                    open_directory(Path(entry.path))
-                    stats["directories_discovered"] += 1
-                    continue
                 if not entry.is_file(follow_symlinks=False):
                     stats["skipped_entries"] += 1
                     continue
@@ -164,8 +267,8 @@ def _search_worker(connection: Any, root_name: str, pattern: str, regex: bool,
         except (OSError, EOFError):
             pass
     finally:
-        for _, iterator, _ in stack:
-            iterator.close()
+        if walker is not None:
+            walker.close()
         connection.close()
 
 
@@ -306,7 +409,8 @@ class SearchManager:
                 stats["completed_directory_entries"] / stats["directories_completed"],
                 stats["scanned_entries"] / stats["directories_discovered"],
             )
-            pending = max(1, stats["directories_discovered"] - stats["directories_completed"])
+            pending = max(1, stats["directories_discovered"] - stats["directories_completed"]
+                          - stats["directories_skipped"])
             remaining = pending * max(1, average)
             estimate = min(99, int(100 * stats["scanned_entries"] / (stats["scanned_entries"] + remaining)))
         end = min(len(job.results), cursor + limit)
@@ -316,6 +420,7 @@ class SearchManager:
             "estimated_percent": estimate,
             "elapsed_seconds": round((job.finished_at or time.monotonic()) - job.started_at, 1),
             "rate_limit": self.settings.entries_per_second, "max_results": self.settings.max_results,
+            "exclude_dirs": list(self.settings.exclude_dirs),
             "results_count": len(job.results), "results": job.results[cursor:end],
             "next_cursor": end if end < len(job.results) else None,
         })

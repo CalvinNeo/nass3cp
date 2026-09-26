@@ -14,7 +14,7 @@
   </header>
   <main>
     <div class="heading">
-      <div><p class="eyebrow">NAS FILES</p><h1>File browser</h1><p class="intro">Browse folders and view file details.</p></div>
+      <h1>File browser</h1>
       <div class="connection"><span>Connected to</span><code>$endpoint</code></div>
     </div>
     $roots
@@ -27,27 +27,34 @@
           <button type="submit">Go</button>
         </form>
       </div>
-      <div class="current-path"><span>Current folder</span><bdi>$path</bdi></div>
       <section class="search-panel" aria-label="File search">
         <form id="search-form" data-path="$path">
-          <label for="search-pattern">Search files</label>
+          <label class="sr-only" for="search-pattern">Search files</label>
           <div class="search-inputs">
-            <input id="search-pattern" name="pattern" type="search" required maxlength="512" placeholder="File name or regular expression" autocomplete="off" spellcheck="false">
+            <input id="search-pattern" name="pattern" type="search" required maxlength="512" placeholder="Search file names…" aria-describedby="search-hint" autocomplete="off" spellcheck="false">
+            <div class="search-options">
+              <label title="Use a regular expression"><input id="search-regex" type="checkbox"> Regex</label>
+              <label><input id="search-case" type="checkbox"> Case sensitive</label>
+            </div>
             <button id="search-start" type="submit">Search</button>
             <button id="search-cancel" type="button" disabled>Cancel</button>
           </div>
-          <div class="search-options">
-            <label><input id="search-regex" type="checkbox"> Regular expression</label>
-            <label><input id="search-case" type="checkbox"> Case sensitive</label>
-            <span>Searches file names in this folder and all subfolders. Supports Unicode.</span>
-          </div>
         </form>
         <div id="search-progress" hidden>
-          <div class="search-summary"><strong id="search-status" role="status" aria-live="polite"></strong><button id="search-close" type="button">Back to folder</button></div>
-          <progress id="search-bar" max="100" aria-label="Estimated search progress"></progress>
-          <p id="search-counts"></p>
-          <p id="search-estimate" class="note"></p>
-          <p id="search-current" class="note"></p>
+          <div class="search-summary">
+            <strong id="search-status" role="status" aria-live="polite"></strong>
+            <progress id="search-bar" max="100" aria-label="Estimated search progress"></progress>
+            <span id="search-percent"></span>
+            <button id="search-close" type="button">Back to folder</button>
+          </div>
+          <p id="search-counts" aria-live="off"></p>
+          <p id="search-scope" class="note" hidden></p>
+          <details class="search-details">
+            <summary>Search details</summary>
+            <p id="search-estimate" class="note"></p>
+            <p id="search-current" class="note"></p>
+            <p id="search-traversal" class="note"></p>
+          </details>
           <p id="search-error" role="alert" hidden></p>
         </div>
         <noscript>Enable JavaScript to search files and view live progress.</noscript>
@@ -64,8 +71,12 @@
         <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="Pagination">$pagination</nav></footer>
       </div>
     </section>
-    <p class="note">Times are shown in your local time zone. Unavailable creation times are shown as N/A. Folder sizes are not calculated.</p>
-    <p class="note">List view only. Image and video thumbnails and previews are not yet available.</p>
+    <details class="view-help">
+      <summary>About this view</summary>
+      <p id="search-hint" class="note">Searches file names in this folder and all subfolders. Supports Unicode. Enable Regex to use a regular expression.</p>
+      <p class="note">Times are shown in your local time zone. Unavailable creation times are shown as N/A. Folder sizes are not calculated.</p>
+      <p class="note">List view only. Image and video thumbnails and previews are not yet available.</p>
+    </details>
   </main>
 </body>
 </html>
