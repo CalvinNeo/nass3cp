@@ -193,6 +193,21 @@ def _inside(path: Path, root: Path) -> bool:
         return False
 
 
+def _birthtime_ns(details: os.stat_result) -> Optional[int]:
+    """Return creation time only when the platform actually exposes it."""
+    value = getattr(details, "st_birthtime_ns", None)
+    if value is not None:
+        return int(value)
+    value = getattr(details, "st_birthtime", None)
+    if value is not None:
+        return int(value * 1_000_000_000)
+    # Before Python 3.12, Windows exposes creation time as st_ctime.
+    # On Unix st_ctime is a metadata change time, never a creation time.
+    if os.name == "nt":
+        return details.st_ctime_ns
+    return None
+
+
 class ServerApp:
     def __init__(self, config: ServerConfig):
         self.config = config
@@ -402,6 +417,7 @@ class ServerApp:
                             "name": entry.name,
                             "type": kind,
                             "size": details.st_size if kind == "file" else None,
+                            "birthtime_ns": _birthtime_ns(details),
                             "mtime_ns": details.st_mtime_ns,
                         }
                     )
@@ -434,6 +450,14 @@ class ServerApp:
         end = min(len(entries), cursor + limit)
         return {
             "path": requested or ".",
+            "resolved_path": directory.as_posix(),
+            "parent_path": (
+                directory.parent.as_posix()
+                if directory.parent != directory
+                and any(_inside(directory.parent, root) for root in self.config.allowed_roots)
+                else None
+            ),
+            "roots": [root.as_posix() for root in self.config.allowed_roots],
             "entries": entries[cursor:end],
             "next_cursor": end if end < len(entries) else None,
             "total": len(entries),

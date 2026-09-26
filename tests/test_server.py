@@ -9,9 +9,11 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from nass3cp.config import S3Config, ServerConfig
+from nass3cp.browse import BrowserServer
 from nass3cp import client, recursive
 from nass3cp.client import ApiClient
 from nass3cp.errors import AuthenticationError
@@ -22,6 +24,7 @@ from nass3cp.server import (
     RequestHandler,
     ServerApp,
     TransferStore,
+    _birthtime_ns,
     check_s3,
 )
 
@@ -412,6 +415,70 @@ class ServerTransferTests(unittest.TestCase):
         with self.assertRaises(ApiError) as caught:
             self.app.list_directory({"path": str(self.base), "cursor": 0, "limit": 10})
         self.assertEqual(caught.exception.code, "path_not_allowed")
+
+    def test_listing_creation_time_and_navigation_stay_within_allowed_roots(self):
+        folder = self.root / "nested"
+        folder.mkdir()
+        item = folder / "file.txt"
+        item.write_text("contents")
+        listing = self.app.list_directory({"path": "nested"})
+        self.assertEqual(listing["resolved_path"], folder.resolve().as_posix())
+        self.assertEqual(listing["parent_path"], self.root.resolve().as_posix())
+        self.assertEqual(listing["roots"], [self.root.resolve().as_posix()])
+        self.assertEqual(listing["entries"][0]["birthtime_ns"], _birthtime_ns(item.stat()))
+        self.assertEqual(listing["entries"][0]["mtime_ns"], item.stat().st_mtime_ns)
+        self.assertIsNone(self.app.list_directory({"path": "."})["parent_path"])
+
+    def test_creation_time_uses_birthtime_and_never_unix_ctime(self):
+        with mock.patch("nass3cp.server.os.name", "posix"):
+            self.assertIsNone(_birthtime_ns(SimpleNamespace(st_ctime_ns=999)))
+            self.assertEqual(_birthtime_ns(SimpleNamespace(st_birthtime=1.5)), 1_500_000_000)
+            self.assertEqual(_birthtime_ns(SimpleNamespace(st_birthtime_ns=123)), 123)
+        with mock.patch("nass3cp.server.os.name", "nt"):
+            self.assertEqual(_birthtime_ns(SimpleNamespace(st_ctime_ns=456)), 456)
+            self.assertEqual(_birthtime_ns(SimpleNamespace(st_birthtime_ns=123, st_ctime_ns=456)), 123)
+
+    def test_browser_reads_real_nas_api_and_respects_root_boundaries_without_s3(self):
+        from http.cookies import SimpleCookie
+        from urllib.parse import urlencode
+
+        (self.root / "nested").mkdir()
+        (self.root / "nested" / "photo.jpg").write_bytes(b"image")
+        nas = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        nas_thread = threading.Thread(target=nas.serve_forever, daemon=True)
+        nas_thread.start()
+        api = ApiClient("http://127.0.0.1:%d" % nas.server_port, "password", timeout=5)
+        browser = BrowserServer(api, ".", port=0)
+        browser_thread = threading.Thread(target=browser.serve_forever, daemon=True)
+        browser_thread.start()
+        connection = http.client.HTTPConnection("127.0.0.1", browser.server_port, timeout=5)
+        try:
+            with mock.patch.object(self.app, "s3") as s3:
+                connection.request("GET", "/?token=" + browser.launch_token)
+                response = connection.getresponse()
+                response.read()
+                cookie = SimpleCookie(response.getheader("Set-Cookie"))
+                headers = {"Cookie": "%s=%s" % (browser.cookie_name, cookie[browser.cookie_name].value)}
+                connection.request("GET", "/?path=nested", headers=headers)
+                response = connection.getresponse()
+                body = response.read().decode("utf-8")
+                self.assertEqual(response.status, 200)
+                self.assertIn("photo.jpg", body)
+                self.assertIn("5 B", body)
+                connection.request("GET", "/?" + urlencode({"path": str(self.base)}), headers=headers)
+                response = connection.getresponse()
+                body = response.read().decode("utf-8")
+                self.assertEqual(response.status, 502)
+                self.assertIn("outside allowed roots", body)
+                self.assertFalse(s3.mock_calls)
+        finally:
+            connection.close()
+            browser.shutdown()
+            browser.server_close()
+            browser_thread.join(timeout=5)
+            nas.shutdown()
+            nas.server_close()
+            nas_thread.join(timeout=5)
 
     def test_path_info_and_recursive_directory_creation(self):
         self.assertEqual(self.app.path_info({"path": "missing"}), {"exists": False})

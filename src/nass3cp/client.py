@@ -443,48 +443,80 @@ class ApiClient:
             pass
 
 
-def list_remote(api: ApiClient, path: str, page_size: int = 500) -> List[Dict[str, Any]]:
+def list_remote_page(
+    api: ApiClient, path: str, cursor: int = 0, page_size: int = 500
+) -> Dict[str, Any]:
+    """Read and validate one page, including optional browser metadata."""
     if isinstance(page_size, bool) or page_size <= 0 or page_size > 1000:
         raise ValueError("page_size must be between 1 and 1000")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise ValueError("cursor must be a non-negative integer")
+    page = api.list_directory(path, cursor, page_size)
+    raw_entries = page.get("entries")
+    if not isinstance(raw_entries, list) or len(raw_entries) > page_size:
+        raise ProtocolError("server directory response has an invalid entries array")
+    result: List[Dict[str, Any]] = []
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, dict):
+            raise ProtocolError("server returned an invalid directory entry")
+        name = raw_entry.get("name")
+        kind = raw_entry.get("type")
+        size = raw_entry.get("size")
+        mtime_ns = raw_entry.get("mtime_ns")
+        if (
+            not isinstance(name, str) or not name or "\x00" in name
+            or name in (".", "..") or "/" in name
+        ):
+            raise ProtocolError("server returned an invalid directory entry name")
+        if kind not in ("directory", "file", "symlink", "other"):
+            raise ProtocolError("server returned an invalid directory entry type")
+        if kind == "file":
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise ProtocolError("server returned an invalid directory entry size")
+        elif size is not None:
+            raise ProtocolError("server returned an invalid directory entry size")
+        if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int):
+            raise ProtocolError("server returned an invalid directory entry timestamp")
+        entry = {"name": name, "type": kind, "size": size, "mtime_ns": mtime_ns}
+        if "birthtime_ns" in raw_entry:
+            birthtime = raw_entry["birthtime_ns"]
+            if birthtime is not None and (isinstance(birthtime, bool) or not isinstance(birthtime, int)):
+                raise ProtocolError("server returned an invalid creation timestamp")
+            entry["birthtime_ns"] = birthtime
+        result.append(entry)
+
+    next_cursor = page.get("next_cursor")
+    if next_cursor is not None and (
+        isinstance(next_cursor, bool)
+        or not isinstance(next_cursor, int)
+        or next_cursor != cursor + len(raw_entries)
+        or next_cursor <= cursor
+    ):
+        raise ProtocolError("server returned an invalid directory cursor")
+    total = page.get("total")
+    if total is not None and (isinstance(total, bool) or not isinstance(total, int) or total < 0):
+        raise ProtocolError("server returned an invalid directory total")
+    for key in ("resolved_path", "parent_path"):
+        value = page.get(key)
+        if value is not None and (not isinstance(value, str) or not value or "\x00" in value):
+            raise ProtocolError("server returned an invalid directory path")
+    roots = page.get("roots", [])
+    if not isinstance(roots, list) or any(
+        not isinstance(root, str) or not root or "\x00" in root for root in roots
+    ):
+        raise ProtocolError("server returned invalid directory roots")
+    return dict(page, entries=result)
+
+
+def list_remote(api: ApiClient, path: str, page_size: int = 500) -> List[Dict[str, Any]]:
     cursor = 0
     result: List[Dict[str, Any]] = []
     while True:
-        page = api.list_directory(path, cursor, page_size)
-        raw_entries = page.get("entries")
-        if not isinstance(raw_entries, list):
-            raise ProtocolError("server directory response has no entries array")
-        for raw_entry in raw_entries:
-            if not isinstance(raw_entry, dict):
-                raise ProtocolError("server returned an invalid directory entry")
-            name = raw_entry.get("name")
-            kind = raw_entry.get("type")
-            size = raw_entry.get("size")
-            mtime_ns = raw_entry.get("mtime_ns")
-            if not isinstance(name, str) or not name or "\x00" in name:
-                raise ProtocolError("server returned an invalid directory entry name")
-            if kind not in ("directory", "file", "symlink", "other"):
-                raise ProtocolError("server returned an invalid directory entry type")
-            if kind == "file":
-                if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-                    raise ProtocolError("server returned an invalid directory entry size")
-            elif size is not None:
-                raise ProtocolError("server returned an invalid directory entry size")
-            if isinstance(mtime_ns, bool) or not isinstance(mtime_ns, int):
-                raise ProtocolError("server returned an invalid directory entry timestamp")
-            result.append(
-                {"name": name, "type": kind, "size": size, "mtime_ns": mtime_ns}
-            )
-
+        page = list_remote_page(api, path, cursor, page_size)
+        result.extend(page["entries"])
         next_cursor = page.get("next_cursor")
         if next_cursor is None:
             return result
-        if (
-            isinstance(next_cursor, bool)
-            or not isinstance(next_cursor, int)
-            or next_cursor != cursor + len(raw_entries)
-            or next_cursor <= cursor
-        ):
-            raise ProtocolError("server returned an invalid directory cursor")
         cursor = next_cursor
 
 

@@ -309,6 +309,24 @@ class ClientTransferTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             client.list_remote(BadListApi(), ".")
 
+    def test_list_page_preserves_optional_creation_time_and_legacy_entries(self):
+        api = ListApi()
+        api.entries[0]["birthtime_ns"] = 123
+        api.entries[1]["birthtime_ns"] = None
+        page = client.list_remote_page(api, ".", 0, 3)
+        self.assertEqual(page["entries"][0]["birthtime_ns"], 123)
+        self.assertIsNone(page["entries"][1]["birthtime_ns"])
+        self.assertNotIn("birthtime_ns", page["entries"][2])
+        self.assertEqual(api.calls, [(".", 0, 3)])
+
+    def test_list_page_rejects_malformed_metadata(self):
+        for field, value in (("birthtime_ns", True), ("birthtime_ns", "today"), ("name", "../escape")):
+            with self.subTest(field=field, value=value):
+                api = ListApi()
+                api.entries[0][field] = value
+                with self.assertRaises(ProtocolError):
+                    client.list_remote_page(api, ".")
+
     def test_upload_reads_hashes_and_sends_all_chunks(self):
         content = b"abcdefghij"
         api = FakeApi()

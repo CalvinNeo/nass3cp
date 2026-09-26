@@ -10,6 +10,7 @@ from nass3cp.cli import (
     _password,
     _safe_name,
     _validate_args,
+    _validate_browse_args,
     _validate_ls_args,
     build_parser,
     main,
@@ -186,6 +187,50 @@ class CliTests(unittest.TestCase):
         self.assertIn("folder/", output.getvalue())
         self.assertIn("bad\\x1bname", output.getvalue())
         self.assertNotIn("bad\x1bname", output.getvalue())
+
+    def test_browse_defaults_to_the_first_allowed_root(self):
+        args = build_parser().parse_args(["--host", "nas.example", "browse"])
+        self.assertEqual(_validate_browse_args(args), ".")
+
+    def test_browse_routes_the_directory_and_local_server_options(self):
+        api = Mock()
+        with patch("nass3cp.cli.ApiClient", return_value=api), patch(
+            "nass3cp.cli.run_browser"
+        ) as browse:
+            main([
+                "--host", "nas.example", "--token", "password", "--web-port", "0",
+                "--no-browser", "browse", "nas:/share/中文 文件",
+            ])
+        browse.assert_called_once_with(api, "/share/中文 文件", port=0, open_browser=False)
+
+    def test_browse_rejects_invalid_options_before_connecting(self):
+        for arguments in (
+            ["browse", "local-path"], ["browse", "nas:", "--recursive"],
+            ["browse", "--dry"], ["browse", "--overwrite"],
+            ["browse", "--mode", "parallel"], ["browse", "--web-port", "65536"],
+            ["browse", "--web-port", "-1"], ["ls", "nas:", "--web-port", "8765"],
+            ["source.bin", "nas:dest.bin", "--no-browser"],
+        ):
+            with self.subTest(arguments=arguments), patch("nass3cp.cli.ApiClient") as api, patch(
+                "nass3cp.cli.getpass.getpass"
+            ) as prompt, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                main(["--host", "nas.example"] + arguments)
+            api.assert_not_called()
+            prompt.assert_not_called()
+
+    def test_browse_uses_the_saved_password_flow(self):
+        store = Mock()
+        store.load.return_value = "saved-password"
+        api = Mock()
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "nass3cp.cli.CredentialStore", return_value=store
+        ), patch("nass3cp.cli.ApiClient", return_value=api), patch(
+            "nass3cp.cli.run_browser"
+        ) as browse, patch("nass3cp.cli.getpass.getpass") as prompt:
+            main(["--host", "nas.example", "browse"])
+        api.check_authenticated.assert_called_once_with()
+        browse.assert_called_once_with(api, ".", port=8765, open_browser=True)
+        prompt.assert_not_called()
 
     def test_recursive_dry_upload_is_routed_with_selected_policy(self):
         api = Mock()

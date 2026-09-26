@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
 from . import __version__
+from .browse import run_browser
 from .client import ApiClient, download, list_remote, upload
 from .credentials import CredentialStore, credential_target
 from .errors import AuthenticationError, Nass3cpError
@@ -89,7 +90,7 @@ def _has_explicit_password(args: argparse.Namespace) -> bool:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="nass3cp",
-        description="Copy files or directory trees through S3, or list a NAS directory",
+        description="Copy files through S3, list a NAS directory, or browse it on localhost",
     )
     parser.add_argument("--host", required=True, help="NAS service hostname or IP")
     parser.add_argument("--port", type=int, default=9443, help="NAS service port (default: 9443)")
@@ -175,16 +176,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to wait for NAS-side work (default: 86400)",
     )
     parser.add_argument("--quiet", action="store_true", help="do not print progress")
+    parser.add_argument(
+        "--web-port", type=int,
+        help="browse: localhost port (default: 8765; 0 selects an available port)",
+    )
+    parser.add_argument(
+        "--no-browser", action="store_true",
+        help="browse: print the local URL without opening a browser",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "src",
         nargs="?",
-        help="source path, or the ls command; prefix NAS paths with nas:",
+        help="source path, or ls / browse; prefix NAS paths with nas:",
     )
     parser.add_argument(
         "dst",
         nargs="?",
-        help="destination path, or the nas: directory used by ls",
+        help="destination path, or NAS directory for ls / browse (browse default: nas:)",
     )
     return parser
 
@@ -198,6 +207,10 @@ def _validate_common_args(args: argparse.Namespace) -> None:
         raise Nass3cpError("--inflight must be between 1 and 128")
     if args.transfer_timeout <= 0:
         raise Nass3cpError("--transfer-timeout must be positive")
+    if args.web_port is not None and not 0 <= args.web_port <= 65535:
+        raise Nass3cpError("--web-port must be between 0 and 65535")
+    if (args.web_port is not None or args.no_browser) and args.src != "browse":
+        raise Nass3cpError("--web-port and --no-browser require browse")
 
 
 def _validate_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
@@ -237,6 +250,18 @@ def _validate_ls_args(args: argparse.Namespace) -> str:
     remote_path = _remote(args.dst)
     if remote_path is None:
         raise Nass3cpError("ls requires one NAS directory prefixed with nas:")
+    return remote_path or "."
+
+
+def _validate_browse_args(args: argparse.Namespace) -> str:
+    _validate_common_args(args)
+    if args.recursive or args.dry or args.mode == "parallel" or args.overwrite:
+        raise Nass3cpError(
+            "browse cannot be combined with --recursive, --dry, --mode parallel, or --overwrite"
+        )
+    remote_path = _remote(args.dst if args.dst is not None else "nas:")
+    if remote_path is None:
+        raise Nass3cpError("browse requires a NAS directory prefixed with nas:")
     return remote_path or "."
 
 
@@ -310,7 +335,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             return
 
         list_path: Optional[str] = None
-        if args.src == "ls" and not args.recursive:
+        browse_path: Optional[str] = None
+        if args.src == "browse":
+            browse_path = _validate_browse_args(args)
+            source_remote = destination_remote = None
+        elif args.src == "ls" and not args.recursive:
             list_path = _validate_ls_args(args)
             source_remote = destination_remote = None
         else:
@@ -360,7 +389,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                             % (credential_store.description, password_target),
                             file=sys.stderr,
                         )
-        if list_path is not None:
+        if browse_path is not None:
+            run_browser(
+                api, browse_path,
+                port=args.web_port if args.web_port is not None else 8765,
+                open_browser=not args.no_browser,
+            )
+        elif list_path is not None:
             _print_directory(list_remote(api, list_path))
         elif args.recursive and source_remote is None:
             recursive_upload_directory(

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>文件浏览 · nass3cp</title>
+  <link rel="stylesheet" href="/browse.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">n</span> nass3cp</div>
+    <span class="local-badge"><span aria-hidden="true">●</span> 本机会话</span>
+  </header>
+  <main>
+    <div class="heading">
+      <div><p class="eyebrow">NAS 文件</p><h1>文件浏览</h1><p class="intro">浏览目录，查看文件的基本信息。</p></div>
+      <div class="connection"><span>已连接到</span><code>$endpoint</code></div>
+    </div>
+    $roots
+    <section class="explorer" aria-label="文件浏览器">
+      <div class="toolbar">
+        <nav class="actions" aria-label="目录导航">$navigation</nav>
+        <form action="/" method="get" class="path-form">
+          <label class="sr-only" for="path">NAS 目录路径</label>
+          <input id="path" name="path" value="$path" placeholder="nas:/目录路径" autocomplete="off" spellcheck="false">
+          <button type="submit">前往</button>
+        </form>
+      </div>
+      <div class="current-path"><span>当前位置</span><bdi>$path</bdi></div>
+      $content
+      <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="分页">$pagination</nav></footer>
+    </section>
+    <p class="note">时间按本机时区显示；无法获取创建时间时显示“不可用”。目录大小不做递归统计。</p>
+    <p class="note">当前支持列表浏览；图片与视频暂不提供缩略图或预览。</p>
+  </main>
+</body>
+</html>
