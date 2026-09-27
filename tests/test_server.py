@@ -563,6 +563,69 @@ class ServerTransferTests(unittest.TestCase):
         self.assertEqual(store.get(state["id"])["status"], "ready")
         self.assertEqual(len(attempts), 2)
 
+    def test_expired_download_cleanup_retries_after_delete_failure_and_restart(self):
+        source = self.root / "cleanup-retry.bin"
+        source.write_bytes(b"abcdefgh")
+
+        for pipeline in (True, False):
+            with self.subTest(pipeline=pipeline):
+                request = {"path": source.name}
+                if pipeline:
+                    request["inflight"] = 2
+                state = self.app.create_download(request)
+                transfer_id = state["id"]
+                if pipeline:
+                    self.app._prepare_download_pipeline(transfer_id)
+                else:
+                    self.app._prepare_download(transfer_id)
+                expired_at = time.time() - self.app.config.transfer_ttl_seconds - 1
+                with mock.patch("nass3cp.server.time.time", return_value=expired_at):
+                    self.app.store.update(transfer_id, status="error")
+
+                failure = (mock.patch.object(self.fake, "delete_chunk", side_effect=OSError("S3 unavailable"))
+                           if pipeline else mock.patch.object(self.fake, "cleanup", return_value=["S3 unavailable"]))
+                with failure, mock.patch("nass3cp.server.time.sleep"), self.assertLogs("nass3cp.server", level="WARNING"):
+                    for _ in range(2):
+                        with mock.patch.object(self.app._stop, "wait", side_effect=[False, True]):
+                            self.app.janitor()
+                        retained = self.app.store.get(transfer_id)
+                        self.assertFalse(retained["objects_cleaned"])
+                        self.assertEqual(retained["updated_at"], expired_at)
+                        self.assertTrue(self.fake.objects)
+
+                # Failed cleanup must also remain discoverable after a restart.
+                restarted = ServerApp(self.app.config)
+                restarted.s3 = self.fake
+                try:
+                    self.assertFalse(restarted.store.get(transfer_id)["objects_cleaned"])
+                    with mock.patch.object(restarted._stop, "wait", side_effect=[False, True]):
+                        restarted.janitor()
+                    self.assertFalse(self.fake.objects)
+                    self.assertNotIn(transfer_id, [item["id"] for item in restarted.store.all()])
+                    self.assertFalse((restarted.store.directory / (transfer_id + ".json")).exists())
+                finally:
+                    restarted.stop()
+                self.app.store.remove(transfer_id)
+
+    def test_pipeline_download_abort_cleans_remaining_cloud_chunks(self):
+        source = self.root / "cancel-download.bin"
+        source.write_bytes(b"abcdefghijklmnop")
+        state = self.app.create_download({"path": source.name, "inflight": 2})
+        transfer_id = state["id"]
+        worker = threading.Thread(target=self.app._prepare_download_pipeline, args=(transfer_id,), daemon=True)
+        with self.assertLogs("nass3cp.server", level="ERROR"):
+            worker.start()
+            self.wait_until(lambda: self.app.store.get(transfer_id)["chunks_staged"] == 2)
+            self.app.acknowledge_download_chunk(transfer_id, 0, {"sha256": hashlib.sha256(b"abcd").hexdigest()})
+            self.assertNotIn((transfer_id, 0), self.fake.objects)
+            self.wait_until(lambda: self.app.store.get(transfer_id)["chunks_staged"] == 3)
+            self.app.abort(transfer_id)
+            worker.join(timeout=5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.fake.objects)
+        self.assertTrue(self.app.store.get(transfer_id)["objects_cleaned"])
+        self.assertEqual(source.read_bytes(), b"abcdefghijklmnop")
+
     def test_restart_marks_active_transfer_failed_and_removes_partial_file(self):
         state = self.app.create_upload({"path": "dest.bin", "size": 4, "overwrite": False})
         self.app.store.transition(state["id"], ("awaiting_upload",), "receiving", sha256="0" * 64)
@@ -833,6 +896,83 @@ class ServerTransferTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_browser_upload_streams_to_verified_nas_file_and_refuses_overwrite(self):
+        self.app.start_worker = lambda function, *args: threading.Thread(target=function, args=args, daemon=True).start()
+        nas = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        nas_thread = threading.Thread(target=nas.serve_forever, daemon=True)
+        nas_thread.start()
+        api = ApiClient("http://127.0.0.1:%d" % nas.server_port, "password", timeout=5)
+        browser = BrowserServer(api, ".", port=0)
+        browser_thread = threading.Thread(target=browser.serve_forever, daemon=True)
+        browser_thread.start()
+        cookie = ""
+
+        def request(path, method="GET", body=None):
+            headers = {"Cookie": cookie, "X-Nass3cp-Request": "upload"}
+            if isinstance(body, dict):
+                headers["Content-Type"] = "application/json"
+                body = json.dumps(body)
+            elif body is not None:
+                headers["Content-Type"] = "application/octet-stream"
+            connection = http.client.HTTPConnection("127.0.0.1", browser.server_port, timeout=5)
+            try:
+                connection.request(method, path, body=body, headers=headers)
+                response = connection.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                connection.close()
+
+        def data_request(method, item, data=None, expected=None, attempts=4, progress=None, cancel_event=None):
+            self.assertEqual(method, "PUT")
+            client._check_upload_cancelled(cancel_event)
+            transfer_id, raw_index = item["url"].rsplit("/", 2)[-2:]
+            self.fake.put_chunk(transfer_id, int(raw_index), data)
+            if progress:
+                progress(len(data))
+            return b""
+
+        try:
+            status, headers, _ = request("/?token=" + browser.launch_token)
+            self.assertEqual(status, 303)
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            with mock.patch("nass3cp.client._data_request", side_effect=data_request):
+                for name, content in (("报告 & #.txt", b"browser-to-NAS content"), ("empty.txt", b"")):
+                    metadata = {"path": ".", "files": [{"name": name, "size": len(content), "mtime_ms": 1700000000123}]}
+                    status, _, body = request("/api/uploads", "POST", metadata)
+                    self.assertEqual(status, 202)
+                    identifier = json.loads(body)["enqueued_ids"][0]
+                    status, _, _ = request("/api/uploads/" + identifier + "/file", "PUT", content)
+                    self.assertEqual(status, 202)
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        items = json.loads(request("/api/uploads")[2])["items"]
+                        item = next(value for value in items if value["id"] == identifier)
+                        if item["status"] in ("complete", "failed"):
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual(item["status"], "complete", item)
+                    self.assertEqual((self.root / name).read_bytes(), content)
+                    self.assertEqual((self.root / name).stat().st_mtime_ns, 1700000000123000000)
+                    self.assertFalse(self.fake.objects)
+                    status, _, body = request("/api/uploads", "POST", metadata)
+                    duplicate = json.loads(body)["enqueued_ids"][0]
+                    status, _, body = request("/api/uploads/" + duplicate + "/file", "PUT", content)
+                    self.assertEqual(status, 409)
+                    self.assertEqual((self.root / name).read_bytes(), content)
+                outside = {"path": str(self.base), "files": [{"name": "escape", "size": 1}]}
+                identifier = json.loads(request("/api/uploads", "POST", outside)[2])["enqueued_ids"][0]
+                self.assertEqual(request("/api/uploads/" + identifier + "/file", "PUT", b"x")[0], 403)
+                self.assertFalse((self.base / "escape").exists())
+            self.assertLessEqual(self.fake.max_objects, 3)
+            self.assertFalse(list(self.root.glob(".nass3cp-*.part")))
+        finally:
+            browser.shutdown()
+            browser.server_close()
+            nas.shutdown()
+            nas.server_close()
+            browser_thread.join(timeout=5)
+            nas_thread.join(timeout=5)
 
     def test_browser_download_reuses_http_pipeline_and_serves_verified_unicode_file(self):
         self.app.start_worker = lambda function, *args: threading.Thread(target=function, args=args, daemon=True).start()

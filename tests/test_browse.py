@@ -137,6 +137,23 @@ class BrowserTests(unittest.TestCase):
         self.assertIn("Previous", body)
         self.api.list_directory.assert_called_once_with("/share", 100, PAGE_SIZE)
 
+    def test_sidebar_marks_the_nearest_shared_root_and_escapes_folder_titles(self):
+        self.login()
+        for path, expected_root in (("/share/projects/<draft>", "/share/projects"),
+                                    ("/share-old", "/share-old"), ("/share/notes", "/share")):
+            with self.subTest(path=path):
+                self.api.list_directory.return_value.update({
+                    "resolved_path": path, "parent_path": "/share", "entries": [],
+                    "roots": ["/share", "/share/projects", "/share-old"],
+                })
+                status, _, body = self.request()
+                self.assertEqual(status, 200)
+                self.assertEqual(body.count('aria-current="location"'), 1)
+                self.assertIn('title="%s" aria-current="location"' % expected_root, body)
+                self.assertNotIn("<draft>", body)
+                if "<draft>" in path:
+                    self.assertIn("<title>&lt;draft&gt; · nass3cp</title>", body)
+
     def test_legacy_directory_responses_work_without_new_metadata(self):
         self.api.list_directory.return_value = {
             "entries": [{"name": "file", "type": "file", "size": 1, "mtime_ns": 0}],
@@ -209,6 +226,47 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.request("/api/downloads", headers, "POST", "[]")[0], 400)
         self.assertEqual(json.loads(self.request("/api/downloads")[2]), {"items": [], "concurrency": 1})
         self.assertEqual(self.request("/downloads.js")[0], 200)
+        self.assertEqual(self.api.mock_calls, [])
+
+    def test_upload_endpoints_require_session_origin_and_explicit_request_headers(self):
+        identifier = "a" * 32
+        route = "/api/uploads/" + identifier + "/file"
+        headers = {"Content-Type": "application/json", "X-Nass3cp-Request": "upload"}
+        raw_headers = dict(headers, **{"Content-Type": "application/octet-stream"})
+        body = json.dumps({"path": "/share", "files": [{"name": "report.txt", "size": 1}]})
+        self.assertEqual(self.request("/api/uploads")[0], 403)
+        self.assertEqual(self.request("/api/uploads", headers, "POST", body)[0], 403)
+        self.assertEqual(self.request(route, raw_headers, "PUT", b"x")[0], 403)
+        self.login()
+        with patch.object(self.server.uploads, "receive") as receive:
+            for invalid in ({}, dict(raw_headers, Origin="https://attacker.test"),
+                            dict(raw_headers, Host="attacker.test"),
+                            dict(raw_headers, **{"Sec-Fetch-Site": "cross-site"}),
+                            dict(raw_headers, **{"X-Nass3cp-Request": "download"}), headers):
+                self.assertEqual(self.request(route, invalid, "PUT", b"x")[0], 403)
+            receive.assert_not_called()
+            for invalid in (dict(raw_headers, **{"Content-Length": "-1"}),
+                            dict(raw_headers, **{"Transfer-Encoding": "chunked"})):
+                self.assertEqual(self.request(route, invalid, "PUT", b"x")[0], 400)
+            receive.assert_not_called()
+        self.assertEqual(self.request(route, raw_headers, "PUT", b"x")[0], 404)
+        self.assertEqual(self.request("/api/uploads/" + identifier + "/cancel", headers, "POST", "{}")[0], 404)
+        self.assertEqual(self.request("/api/uploads", headers, "POST", "[]")[0], 400)
+        self.assertEqual(self.request("/uploads.js")[0], 200)
+        self.assertEqual(self.api.mock_calls, [])
+
+    def test_upload_queue_preserves_unicode_metadata_and_cancels_without_nas_operations(self):
+        self.login()
+        headers = {"Content-Type": "application/json", "X-Nass3cp-Request": "upload"}
+        body = {"path": "/share", "files": [{"name": "报告 & #.txt", "size": 0, "mtime_ms": 123}]}
+        status, _, response = self.request("/api/uploads", headers, "POST", json.dumps(body))
+        self.assertEqual(status, 202)
+        identifier = json.loads(response)["enqueued_ids"][0]
+        queued = json.loads(self.request("/api/uploads")[2])
+        self.assertEqual(queued["items"][0]["path"], "/share/报告 & #.txt")
+        status, _, response = self.request("/api/uploads/" + identifier + "/cancel", headers, "POST", "{}")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(response)["items"][0]["status"], "cancelled")
         self.assertEqual(self.api.mock_calls, [])
 
     def test_search_proxy_requires_session_and_same_origin_json_requests(self):

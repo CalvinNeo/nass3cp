@@ -31,9 +31,11 @@
   function persist(key, value) {
     try { sessionStorage.setItem(key, JSON.stringify([...value])); } catch (_) { /* Optional persistence. */ }
   }
-  function showError(message) {
+  function showError(message, reveal = true) {
     error.textContent = message;
     error.hidden = !message;
+    document.dispatchEvent(new Event("nass3cp:transfers-changed"));
+    if (message && reveal) document.dispatchEvent(new Event("nass3cp:show-transfers"));
   }
   function pathOf(box) {
     try { return JSON.parse(box.dataset.filePath); } catch (_) { return null; }
@@ -44,7 +46,10 @@
     return [...container.querySelectorAll(".file-select")];
   }
   function refreshSelection() {
-    for (const box of document.querySelectorAll(".file-select")) box.checked = selected.has(pathOf(box));
+    for (const box of document.querySelectorAll(".file-select")) {
+      box.checked = selected.has(pathOf(box));
+      box.closest("tr").classList.toggle("is-selected", box.checked);
+    }
     const visible = visibleBoxes();
     const checked = visible.filter(box => box.checked).length;
     for (const box of document.querySelectorAll(".select-all")) {
@@ -53,6 +58,7 @@
       box.disabled = !visible.length;
     }
     count.textContent = selected.size + (selected.size === 1 ? " file selected" : " files selected");
+    document.getElementById("selection-bar").hidden = !selected.size;
     start.disabled = submitting || !selected.size;
     clear.disabled = submitting || !selected.size;
     persist(selectionKey, selected);
@@ -143,6 +149,9 @@
     panel.hidden = !data.items.length;
     const live = data.items.filter(item => !terminal.has(item.status));
     const queued = live.filter(item => item.status === "queued").length;
+    panel.dataset.pending = live.length;
+    panel.dataset.attention = data.items.some(item => item.status === "failed" || item.status === "expired");
+    document.dispatchEvent(new Event("nass3cp:transfers-changed"));
     summary.textContent = live.length + " pending · " + queued + " queued · File concurrency: " + data.concurrency;
     const ids = new Set(data.items.map(item => item.id));
     for (const [id, view] of rowViews) {
@@ -193,7 +202,7 @@
     } catch (problem) {
       if (version === generation) {
         pollError = problem.message + " Retrying progress…";
-        showError(pollError);
+        showError(pollError, false);
       }
     } finally {
       if (version === generation) timer = setTimeout(() => poll(version), document.hidden ? 3000 : 1000);
@@ -222,6 +231,7 @@
     try {
       await mutate("/api/downloads", {paths});
       for (const path of paths) selected.delete(path);
+      document.dispatchEvent(new Event("nass3cp:show-transfers"));
       panel.scrollIntoView({block: "nearest", behavior: "smooth"});
     } catch (problem) { showError(problem.message); }
     finally { submitting = false; refreshSelection(); }

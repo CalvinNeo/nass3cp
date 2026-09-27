@@ -3,96 +3,156 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>File browser · nass3cp</title>
+  <title>$folder_name · nass3cp</title>
   <link rel="stylesheet" href="/browse.css">
   <script src="/browse.js" defer></script>
   <script src="/downloads.js" defer></script>
+  <script src="/uploads.js" defer></script>
 </head>
 <body>
-  <header class="app-header">
-    <div class="brand"><span class="brand-mark" aria-hidden="true">n</span> nass3cp</div>
-    <span class="local-badge"><span aria-hidden="true">●</span> Local session</span>
-  </header>
-  <main>
-    <div class="heading">
-      <h1>File browser</h1>
-      <div class="connection"><span>Connected to</span><code>$endpoint</code></div>
-    </div>
-    $roots
+  <main class="browser-window">
+    <aside class="sidebar" aria-label="Places">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">n</span> nass3cp</div>
+      <div class="sidebar-content">
+        <p class="sidebar-label">Favorites</p>
+        $start_folder
+        $roots
+      </div>
+      <div class="sidebar-footer">
+        <details class="view-help">
+          <summary>About this browser</summary>
+          <div class="help-content">
+            <p>Browse folders and select files to download. Search includes subfolders.</p>
+            <p>Times use your local time zone. Unavailable creation times appear as N/A. Folder sizes are not calculated.</p>
+            <p>Image and video previews are not yet available.</p>
+          </div>
+        </details>
+        <div class="connection"><span class="connection-label"><span class="status-dot" aria-hidden="true"></span> Local session</span><code title="$endpoint">$endpoint</code></div>
+      </div>
+    </aside>
     <section class="explorer" aria-label="File browser">
-      <div class="toolbar">
-        <nav class="actions" aria-label="Folder navigation">$navigation</nav>
-        <form action="/" method="get" class="path-form">
-          <label class="sr-only" for="path">NAS folder path</label>
-          <input id="path" name="path" value="$path" placeholder="nas:/path/to/folder" autocomplete="off" spellcheck="false">
-          <button type="submit">Go</button>
-        </form>
-      </div>
-      <section class="search-panel" aria-label="File search">
-        <form id="search-form" data-path="$path">
-          <label class="sr-only" for="search-pattern">Search files</label>
-          <div class="search-inputs">
-            <input id="search-pattern" name="pattern" type="search" required maxlength="512" placeholder="Search file names…" aria-describedby="search-hint" autocomplete="off" spellcheck="false">
-            <div class="search-options">
-              <label title="Use a regular expression"><input id="search-regex" type="checkbox"> Regex</label>
-              <label><input id="search-case" type="checkbox"> Case sensitive</label>
+      <header class="toolbar">
+        <nav class="actions folder-navigation" aria-label="Folder navigation">$navigation</nav>
+        <div class="current-folder"><h1 title="$folder_name">$folder_name</h1><span title="$path">$path</span></div>
+        <div class="toolbar-tools">
+          <details id="location-tools" class="tool-popover location-tools">
+            <summary class="tool-button" title="Go to folder (Ctrl/Cmd+Shift+G)" aria-label="Go to folder">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z"/><path d="M8 13h8m-3-3 3 3-3 3"/></svg>
+            </summary>
+            <div class="popover-content">
+              <h2>Go to folder</h2>
+              <form action="/" method="get" class="path-form">
+                <label class="sr-only" for="path">NAS folder path</label>
+                <input id="path" name="path" value="$path" placeholder="nas:/path/to/folder" autocomplete="off" spellcheck="false">
+                <button type="submit">Go</button>
+              </form>
             </div>
-            <button id="search-start" type="submit">Search</button>
-            <button id="search-cancel" type="button" disabled>Cancel</button>
-          </div>
-        </form>
-        <div id="search-progress" hidden>
-          <div class="search-summary">
-            <strong id="search-status" role="status" aria-live="polite"></strong>
-            <progress id="search-bar" max="100" aria-label="Estimated search progress"></progress>
-            <span id="search-percent"></span>
-            <button id="search-close" type="button">Back to folder</button>
-          </div>
-          <p id="search-counts" aria-live="off"></p>
-          <p id="search-scope" class="note" hidden></p>
-          <details class="search-details">
-            <summary>Search details</summary>
-            <p id="search-estimate" class="note"></p>
-            <p id="search-current" class="note"></p>
-            <p id="search-traversal" class="note"></p>
           </details>
-          <p id="search-error" role="alert" hidden></p>
+          <span class="tool-divider" aria-hidden="true"></span>
+          <details id="search-tools" class="tool-popover">
+            <summary class="tool-button" title="Search files (Ctrl/Cmd+K)" aria-label="Search files">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></svg>
+            </summary>
+            <div class="popover-content">
+              <h2>Search this folder</h2>
+              <form id="search-form" data-path="$path">
+                <label class="sr-only" for="search-pattern">Search file names</label>
+                <input id="search-pattern" name="pattern" type="search" required maxlength="512" placeholder="Search file names…" aria-describedby="search-hint" autocomplete="off" spellcheck="false">
+                <div class="search-options">
+                  <label title="Use a regular expression"><input id="search-regex" type="checkbox"> Regex</label>
+                  <label><input id="search-case" type="checkbox"> Case sensitive</label>
+                </div>
+                <p id="search-hint" class="note">Searches names in this folder and all subfolders.</p>
+                <div class="popover-actions"><button id="search-start" type="submit">Search</button></div>
+              </form>
+            </div>
+          </details>
+          <details id="upload-tools" class="tool-popover">
+            <summary class="tool-button" title="Upload files" aria-label="Upload files">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></svg>
+            </summary>
+            <div class="popover-content">
+              <h2>Upload files</h2>
+              <form id="upload-form" data-path="$path">
+                <p id="upload-hint" class="note">Upload to <bdi>$path</bdi></p>
+                <label class="file-chooser" for="upload-files">Choose local files
+                  <input id="upload-files" type="file" multiple aria-describedby="upload-hint" $upload_disabled>
+                </label>
+                <span id="upload-selection" class="note" role="status">No local files selected</span>
+                <p class="note">Existing files are kept.</p>
+                <div class="popover-actions"><button id="upload-start" type="submit" disabled>Upload files</button></div>
+              </form>
+            </div>
+          </details>
+          <button id="transfers-toggle" class="tool-button" type="button" title="Transfers" aria-label="Transfers" aria-haspopup="dialog">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4v16m-4-4 4 4 4-4M16 20V4m-4 4 4-4 4 4"/></svg>
+            <span id="transfer-count" class="transfer-badge" hidden></span>
+          </button>
         </div>
-        <noscript>Enable JavaScript to search, select files and view download progress.</noscript>
-      </section>
-      <div class="selection-bar">
-        <span id="selection-count">0 files selected</span>
-        <button id="download-selected" type="button" disabled>Download selected</button>
-        <button id="selection-clear" class="secondary" type="button" disabled>Clear selection</button>
-        <span class="note">Files only · Selection kept across folders and pages</span>
+      </header>
+      <div id="search-progress" class="search-panel" hidden>
+        <div class="search-summary">
+          <strong id="search-status" role="status" aria-live="polite"></strong>
+          <progress id="search-bar" max="100" aria-label="Estimated search progress"></progress>
+          <span id="search-percent"></span>
+          <button id="search-cancel" class="secondary" type="button" disabled>Cancel</button>
+          <button id="search-close" class="secondary" type="button">Back to folder</button>
+        </div>
+        <p id="search-counts" aria-live="off"></p>
+        <p id="search-scope" class="note" hidden></p>
+        <details class="search-details">
+          <summary>Search details</summary>
+          <p id="search-estimate" class="note"></p>
+          <p id="search-current" class="note"></p>
+          <p id="search-traversal" class="note"></p>
+        </details>
+        <p id="search-error" role="alert" hidden></p>
       </div>
-      <p id="download-error" role="alert" hidden></p>
-      <section id="search-results" aria-label="Search results" hidden>
-        <div class="table-scroll"><table>
-          <thead><tr><th scope="col"><input type="checkbox" class="select-all" aria-label="Select visible search results">Name / Location</th><th scope="col" class="size">Size</th><th scope="col">Created</th><th scope="col">Modified</th></tr></thead>
-          <tbody id="search-rows"></tbody>
-        </table></div>
-        <p id="search-empty" class="empty">Waiting for results…</p>
-      </section>
-      <div id="directory-view">
-        $content
-        <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="Pagination">$pagination</nav></footer>
+      <div class="file-area">
+        <section id="search-results" aria-label="Search results" hidden>
+          <div class="table-scroll"><table>
+            <thead><tr><th scope="col"><input type="checkbox" class="select-all" aria-label="Select visible search results">Name / Location</th><th scope="col" class="size">Size</th><th scope="col" class="created">Created</th><th scope="col">Modified</th></tr></thead>
+            <tbody id="search-rows"></tbody>
+          </table></div>
+          <p id="search-empty" class="empty">Waiting for results…</p>
+        </section>
+        <div id="directory-view">$content</div>
       </div>
+      <footer class="list-footer">
+        <div id="folder-status" class="folder-status"><span>$summary</span><nav class="actions" aria-label="Pagination">$pagination</nav></div>
+        <div id="selection-bar" class="selection-bar" hidden>
+          <span id="selection-count" role="status">0 files selected</span>
+          <span class="selection-note">Across folders and pages</span>
+          <button id="download-selected" type="button" disabled>Download selected</button>
+          <button id="selection-clear" class="secondary" type="button" disabled>Clear selection</button>
+        </div>
+        <noscript>Enable JavaScript to search, upload files and view transfer progress.</noscript>
+      </footer>
     </section>
-    <section id="downloads" class="downloads" aria-label="Downloads" hidden>
-      <div class="download-heading"><h2>Downloads</h2><span id="download-summary"></span></div>
-      <div class="table-scroll download-scroll"><table>
-        <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
-        <tbody id="download-rows"></tbody>
-      </table></div>
-      <p class="download-hint note">Files are verified before saving. Allow multiple downloads in your browser, or click Save file. Ready files hold a queue slot for up to 10 minutes. Check your browser for the final save status.</p>
-    </section>
-    <details class="view-help">
-      <summary>About this view</summary>
-      <p id="search-hint" class="note">Searches file names in this folder and all subfolders. Supports Unicode. Enable Regex to use a regular expression.</p>
-      <p class="note">Times are shown in your local time zone. Unavailable creation times are shown as N/A. Folder sizes are not calculated.</p>
-      <p class="note">List view only. Image and video thumbnails and previews are not yet available.</p>
-    </details>
   </main>
+  <dialog id="transfers-dialog" class="transfers-drawer" aria-labelledby="transfers-title">
+    <header class="drawer-heading"><div><h2 id="transfers-title">Transfers</h2><p class="note">Uploads and downloads in this session</p></div><button id="transfers-close" class="tool-button" type="button" aria-label="Close transfers" autofocus><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg></button></header>
+    <div class="drawer-content">
+      <p id="upload-error" role="alert" hidden></p>
+      <p id="download-error" role="alert" hidden></p>
+      <div id="transfers-empty" class="transfers-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 4v16m-4-4 4 4 4-4M16 20V4m-4 4 4-4 4 4"/></svg><h3>No transfers yet</h3><p>Upload local files or select files to download.</p></div>
+      <section id="uploads" class="downloads" aria-label="Uploads" hidden>
+        <div class="download-heading"><h2>Uploads</h2><a id="upload-refresh" class="button secondary" href="/">Refresh folder</a><span id="upload-summary" role="status"></span></div>
+        <div class="table-scroll download-scroll"><table>
+          <thead><tr><th scope="col">File / Destination</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
+          <tbody id="upload-rows"></tbody>
+        </table></div>
+        <p class="download-hint note">Keep this page open while local files are waiting or being received. Refresh the folder to see completed uploads.</p>
+      </section>
+      <section id="downloads" class="downloads" aria-label="Downloads" hidden>
+        <div class="download-heading"><h2>Downloads</h2><span id="download-summary"></span></div>
+        <div class="table-scroll download-scroll"><table>
+          <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
+          <tbody id="download-rows"></tbody>
+        </table></div>
+        <p class="download-hint note">Files are verified before saving. Allow multiple downloads in your browser, or click Save file. Ready files are kept for up to 10 minutes.</p>
+      </section>
+    </div>
+  </dialog>
 </body>
 </html>

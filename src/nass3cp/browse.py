@@ -1,4 +1,4 @@
-"""A loopback-only NAS browser with verified, per-file downloads."""
+"""A loopback-only NAS browser with verified, per-file transfers."""
 
 import hmac
 import html
@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from .client import ApiClient, _human_bytes, list_remote_page
 from .downloads import DownloadError, DownloadManager
 from .errors import AuthenticationError, DownloadCancelled, Nass3cpError
+from .uploads import UploadError, UploadManager
 
 
 PAGE_SIZE = 100
@@ -38,6 +39,27 @@ def _url(path: str, cursor: int = 0) -> str:
 
 def _link(label: str, path: str, cursor: int = 0, css: str = "button") -> str:
     return '<a class="%s" href="%s">%s</a>' % (css, _escape(_url(path, cursor)), _escape(label))
+
+
+def _icon(name: str) -> str:
+    paths = {
+        "home": "M3 10 12 3l9 7M5 9v12h5v-7h4v7h5V9",
+        "folder": "M3 7V5h6l2 3h10v12H3V7Z",
+        "up": "M12 20V4m-6 6 6-6 6 6",
+        "refresh": "M20 11a8 8 0 1 0-2 6M20 4v7h-7",
+    }
+    return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="%s"/></svg>' % paths[name]
+
+
+def _navigation_link(label: str, path: Optional[str], icon: str, cursor: int = 0) -> str:
+    content = _icon(icon) + '<span class="sr-only">%s</span>' % _escape(label)
+    if path is None:
+        return '<span class="tool-button disabled" aria-disabled="true" title="%s">%s</span>' % (
+            _escape(label), content,
+        )
+    return '<a class="tool-button" href="%s" title="%s">%s</a>' % (
+        _escape(_url(path, cursor)), _escape(label), content,
+    )
 
 
 def _timestamp(value: Optional[int]) -> str:
@@ -62,15 +84,25 @@ def _render(
     parent = page.get("parent_path")
     if "parent_path" not in page and current not in (".", "/"):
         parent = posixpath.dirname(current.rstrip("/")) or "."
-    navigation = _link("Start folder", server.initial_path)
-    navigation += (
-        _link("↑ Up", parent) if parent is not None
-        else '<span class="button disabled" aria-disabled="true">↑ Up</span>'
+    navigation = _navigation_link("Up", parent, "up")
+    navigation += _navigation_link("Refresh", current, "refresh", cursor)
+    start_folder = '<a class="sidebar-link" href="%s">%s<span>Start folder</span></a>' % (
+        _escape(_url(server.initial_path)), _icon("home"),
     )
-    navigation += _link("Refresh", current, cursor)
-    roots = "".join(_link(root, root, css="root") for root in page.get("roots", []))
+    shared_roots = page.get("roots", [])
+    active_root = max(
+        (root for root in shared_roots if current == root or current.startswith(root.rstrip("/") + "/")),
+        key=len, default=None,
+    )
+    roots = "".join(
+        '<a class="sidebar-link%s" href="%s" title="%s"%s>%s<span>%s</span></a>' % (
+            " active" if root == active_root else "", _escape(_url(root)), _escape(root),
+            ' aria-current="location"' if root == active_root else "", _icon("folder"),
+            _escape(posixpath.basename(root.rstrip("/")) or root),
+        ) for root in shared_roots
+    )
     if roots:
-        roots = '<nav class="roots" aria-label="Shared folders"><span>Shared folders</span>%s</nav>' % roots
+        roots = '<nav class="roots" aria-label="Shared folders"><p class="sidebar-label">Shared folders</p>%s</nav>' % roots
 
     rows = []
     for entry in page.get("entries", []):
@@ -84,7 +116,7 @@ def _render(
                 _escape("Select " + name),
             )
         if kind == "directory":
-            name_html = '<a href="%s">%s<span aria-hidden="true"> /</span></a>' % (
+            name_html = '<a href="%s">%s</a>' % (
                 _escape(_url(posixpath.join(current, name))), name_html,
             )
         size = entry["size"]
@@ -94,7 +126,7 @@ def _render(
         )
         rows.append(
             '<tr><td class="name">%s<span class="icon %s" aria-hidden="true"></span>%s</td>'
-            '<td>%s</td><td class="size">%s</td><td>%s</td><td>%s</td></tr>'
+            '<td>%s</td><td class="size">%s</td><td class="created">%s</td><td>%s</td></tr>'
             % (selection, kind, name_html, _KINDS[kind], size_html,
                _timestamp(entry.get("birthtime_ns")), _timestamp(entry["mtime_ns"]))
         )
@@ -110,7 +142,7 @@ def _render(
         content = (
             '<div class="table-scroll"><table><caption class="sr-only">NAS file list</caption>'
             '<thead><tr><th scope="col"><input type="checkbox" class="select-all" aria-label="Select visible files">Name</th><th scope="col">Type</th>'
-            '<th scope="col" class="size">Size</th><th scope="col">Created</th>'
+            '<th scope="col" class="size">Size</th><th scope="col" class="created">Created</th>'
             '<th scope="col">Modified</th></tr></thead><tbody>%s</tbody></table></div>'
         ) % "".join(rows)
 
@@ -127,9 +159,12 @@ def _render(
         pagination += _link("Next", current, page["next_cursor"])
     return server.template.substitute(
         endpoint=_escape(server.api.base_url), path=_escape("nas:" + current),
+        folder_name=_escape(posixpath.basename(current.rstrip("/")) if current not in (".", "/") else "Files"),
+        start_folder=start_folder,
         navigation=navigation, roots=roots, content=content,
         summary=_escape(summary) if error is None else "Could not load folder",
         pagination=pagination,
+        upload_disabled="disabled" if error is not None else "",
     ).encode("utf-8")
 
 
@@ -149,7 +184,9 @@ class BrowserServer(ThreadingHTTPServer):
         self.stylesheet = resources.read_binary("nass3cp", "browse.css")
         self.search_script = resources.read_binary("nass3cp", "browse.js")
         self.download_script = resources.read_binary("nass3cp", "downloads.js")
+        self.upload_script = resources.read_binary("nass3cp", "uploads.js")
         self.downloads = DownloadManager(api.clone, download_concurrency, jobs, inflight, transfer_timeout)
+        self.uploads = UploadManager(api.clone, jobs, inflight, transfer_timeout)
         self.search_ids = set()  # type: set
         self.active_search_ids = set()  # type: set
         super().__init__(("127.0.0.1", port), BrowserHandler)
@@ -161,6 +198,7 @@ class BrowserServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         try:
+            self.uploads.stop()
             self.downloads.stop()
             with self.api_lock:
                 for identifier in self.active_search_ids:
@@ -260,19 +298,32 @@ class BrowserHandler(BaseHTTPRequestHandler):
         if not self._authenticated():
             self._message(403, "Open the full browser URL shown in the terminal.")
             return
-        # Custom headers and same-origin checks protect all actions, including downloads.
+        # Custom headers and same-origin checks protect all actions.
         is_download = self.path.startswith("/api/downloads")
-        if (self.headers.get("X-Nass3cp-Request") != ("download" if is_download else "search")
+        is_upload = self.path.startswith("/api/uploads")
+        action = "upload" if is_upload else "download" if is_download else "search"
+        if (self.headers.get("X-Nass3cp-Request") != action
                 or self.headers.get_content_type() != "application/json"):
             self._json(403, {"error": "Requests must come from this page."})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= length <= (2 * 1024 * 1024 if is_download else 16384):
+            if (self.headers.get("Transfer-Encoding") is not None
+                    or len(self.headers.get_all("Content-Length", [])) != 1
+                    or not 1 <= length <= (2 * 1024 * 1024 if is_download or is_upload else 16384)):
                 raise ValueError("invalid request length")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("invalid request body")
+            if is_upload:
+                if self.path == "/api/uploads":
+                    self._json(202, self.browser.uploads.enqueue(body))
+                else:
+                    match = re.fullmatch(r"/api/uploads/([0-9a-f]{32})/cancel", self.path)
+                    if not match:
+                        raise UploadError(404, "Upload endpoint not found.")
+                    self._json(200, self.browser.uploads.cancel(match.group(1)))
+                return
             if is_download:
                 if self.path == "/api/downloads":
                     self._json(202, self.browser.downloads.enqueue(body))
@@ -307,7 +358,39 @@ class BrowserHandler(BaseHTTPRequestHandler):
                 self._json(200, value)
         except (ValueError, UnicodeError):
             self._json(400, {"error": "Invalid request."})
-        except DownloadError as exc:
+        except (DownloadError, UploadError) as exc:
+            self._json(exc.status, {"error": str(exc)})
+        except (Nass3cpError, OSError) as exc:
+            self._search_error(exc)
+
+    def do_PUT(self) -> None:
+        try:
+            self._upload_file()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass  # An interrupted upload is cleaned up by the upload manager.
+
+    def _upload_file(self) -> None:
+        if not self._local_request():
+            return
+        if not self._authenticated():
+            self._message(403, "Open the full browser URL shown in the terminal.")
+            return
+        if (self.headers.get("X-Nass3cp-Request") != "upload"
+                or self.headers.get_content_type() != "application/octet-stream"):
+            self._json(403, {"error": "Requests must come from this page."})
+            return
+        match = re.fullmatch(r"/api/uploads/([0-9a-f]{32})/file", self.path)
+        if not match:
+            self._json(404, {"error": "Upload endpoint not found."})
+            return
+        try:
+            lengths = self.headers.get_all("Content-Length", [])
+            if (self.headers.get("Transfer-Encoding") is not None or len(lengths) != 1
+                    or not re.fullmatch(r"[0-9]{1,16}", lengths[0])):
+                raise UploadError(400, "A single valid Content-Length is required.")
+            value = self.browser.uploads.receive(match.group(1), self.rfile, int(lengths[0]))
+            self._json(202, value)
+        except UploadError as exc:
             self._json(exc.status, {"error": str(exc)})
         except (Nass3cpError, OSError) as exc:
             self._search_error(exc)
@@ -373,6 +456,12 @@ class BrowserHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/downloads.js":
             self._send(200, self.browser.download_script, "text/javascript; charset=utf-8")
+            return
+        if parsed.path == "/uploads.js":
+            self._send(200, self.browser.upload_script, "text/javascript; charset=utf-8")
+            return
+        if parsed.path == "/api/uploads":
+            self._json(200, self.browser.uploads.state())
             return
         if parsed.path == "/api/downloads":
             self._json(200, self.browser.downloads.state())

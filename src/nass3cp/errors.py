@@ -18,5 +18,9 @@ class DownloadCancelled(Nass3cpError):
     """A caller cancelled an in-progress download."""
 
 
+class UploadCancelled(Nass3cpError):
+    """A caller cancelled an in-progress upload."""
+
+
 class S3Error(Nass3cpError):
     """An S3-compatible endpoint request failed."""

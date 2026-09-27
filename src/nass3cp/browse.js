@@ -1,6 +1,74 @@
 "use strict";
 
 (() => {
+  const popovers = [...document.querySelectorAll(".tool-popover")];
+  const dialog = document.getElementById("transfers-dialog");
+  const toggle = document.getElementById("transfers-toggle");
+  const badge = document.getElementById("transfer-count");
+  if (!dialog) return;
+
+  function closePopovers(except) {
+    for (const popover of popovers) if (popover !== except) popover.open = false;
+  }
+  for (const popover of popovers) {
+    popover.addEventListener("toggle", () => {
+      if (!popover.open) return;
+      closePopovers(popover);
+      const input = popover.querySelector("input:not(:disabled)");
+      if (input) { input.focus(); if (input.type === "text") input.select(); }
+    });
+  }
+  document.addEventListener("pointerdown", event => {
+    for (const popover of popovers) if (!popover.contains(event.target)) popover.open = false;
+  });
+  document.addEventListener("focusin", event => {
+    for (const popover of popovers) if (!popover.contains(event.target)) popover.open = false;
+  });
+  document.addEventListener("keydown", event => {
+    if (dialog.open) return;
+    if (event.key === "Escape") {
+      const open = popovers.find(popover => popover.open);
+      if (open) { event.preventDefault(); open.open = false; open.querySelector("summary").focus(); }
+    }
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    const id = event.key.toLowerCase() === "k" ? "search-tools" :
+      event.shiftKey && event.key.toLowerCase() === "g" ? "location-tools" : null;
+    if (id) {
+      event.preventDefault();
+      const popover = document.getElementById(id);
+      closePopovers(popover);
+      popover.open = true;
+      popover.querySelector("input").focus();
+    }
+  });
+  function showTransfers() {
+    closePopovers();
+    if (!dialog.open) { toggle.focus(); dialog.showModal(); }
+  }
+  toggle.addEventListener("click", showTransfers);
+  document.getElementById("transfers-close").addEventListener("click", () => dialog.close());
+  dialog.addEventListener("click", event => {
+    const bounds = dialog.getBoundingClientRect();
+    if (event.target === dialog && (event.clientX < bounds.left || event.clientX > bounds.right ||
+        event.clientY < bounds.top || event.clientY > bounds.bottom)) dialog.close();
+  });
+  document.addEventListener("nass3cp:show-transfers", showTransfers);
+  document.addEventListener("nass3cp:transfers-changed", () => {
+    const panels = [document.getElementById("uploads"), document.getElementById("downloads")];
+    const pending = panels.reduce((total, panel) => total + Number(panel.dataset.pending || 0), 0);
+    const hasError = panels.some(panel => panel.dataset.attention === "true") ||
+      !document.getElementById("upload-error").hidden || !document.getElementById("download-error").hidden;
+    document.getElementById("transfers-empty").hidden = panels.some(panel => !panel.hidden) || hasError;
+    badge.hidden = !pending && !hasError;
+    badge.textContent = hasError ? "!" : pending;
+    badge.classList.toggle("has-error", hasError);
+    const label = hasError ? "Transfers need attention" : pending ? "Transfers: " + pending + " pending" : "Transfers";
+    toggle.setAttribute("aria-label", label);
+    toggle.title = label;
+  });
+})();
+
+(() => {
   const form = document.getElementById("search-form");
   if (!form) return;
   const start = document.getElementById("search-start");
@@ -95,7 +163,9 @@
       bytes.className = "size";
       bytes.textContent = size(item.size);
       bytes.title = item.size.toLocaleString("en-US") + " bytes";
-      row.insertCell().textContent = date(item.birthtime_ns);
+      const created = row.insertCell();
+      created.className = "created";
+      created.textContent = date(item.birthtime_ns);
       row.insertCell().textContent = date(item.mtime_ns);
       rows.appendChild(row);
     }
@@ -180,6 +250,9 @@
     empty.textContent = "Waiting for results…";
     progress.hidden = results.hidden = false;
     directory.hidden = true;
+    document.getElementById("folder-status").hidden = true;
+    document.getElementById("search-tools").open = false;
+    close.focus();
     document.dispatchEvent(new Event("nass3cp:files-changed"));
     start.disabled = true;
     cancel.disabled = true;
@@ -243,6 +316,8 @@
       remember(null);
       progress.hidden = results.hidden = true;
       directory.hidden = false;
+      document.getElementById("folder-status").hidden = false;
+      document.querySelector("#search-tools summary").focus();
       document.dispatchEvent(new Event("nass3cp:files-changed"));
       start.disabled = false;
       cancel.disabled = true;
@@ -263,6 +338,7 @@
       document.getElementById("search-case").checked = saved.case_sensitive;
       progress.hidden = results.hidden = false;
       directory.hidden = true;
+      document.getElementById("folder-status").hidden = true;
       start.disabled = true;
       cancel.disabled = false;
       status.textContent = "Restoring search…";

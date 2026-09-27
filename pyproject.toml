@@ -23,4 +23,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-nass3cp = ["browse.html", "browse.css", "browse.js", "downloads.js"]
+nass3cp = ["browse.html", "browse.css", "browse.js", "downloads.js", "uploads.js"]

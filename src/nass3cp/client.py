@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request
 
 from .compression import DecodingWriter
-from .errors import AuthenticationError, DownloadCancelled, Nass3cpError, ProtocolError
+from .errors import AuthenticationError, DownloadCancelled, Nass3cpError, ProtocolError, UploadCancelled
 from .net import secure_opener
 
 
@@ -31,6 +31,11 @@ _RESUME_FILE_LIMIT = 16 * 1024 * 1024
 def _check_download_cancelled(event: Optional[threading.Event]) -> None:
     if event is not None and event.is_set():
         raise DownloadCancelled("Download cancelled")
+
+
+def _check_upload_cancelled(event: Optional[threading.Event]) -> None:
+    if event is not None and event.is_set():
+        raise UploadCancelled("Upload cancelled")
 
 
 def _download_pause(seconds: float, event: Optional[threading.Event]) -> None:
@@ -624,8 +629,12 @@ def _data_request(
         if progress is not None:
             progress(0)
         request_data: Any = data
-        if method == "PUT" and progress is not None:
-            request_data = _ProgressReader(data or b"", progress)
+        if method == "PUT" and (progress is not None or cancel_event is not None):
+            def report(count: int) -> None:
+                _check_upload_cancelled(cancel_event)
+                if progress is not None:
+                    progress(count)
+            request_data = _ProgressReader(data or b"", report)
         request = Request(url, data=request_data, headers=clean_headers, method=method)
         try:
             response = _data_opener().open(request, timeout=30 if cancel_event is not None else 300)
@@ -932,10 +941,12 @@ def _wait_for_pipeline_capacity(
     chunks: int,
     previous_consumed: int,
     timeout: int,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + timeout
     delay = 0.1
     while True:
+        _check_upload_cancelled(cancel_event)
         state = api.state(transfer_id)
         _check_pipeline_state(state, ("receiving",))
         _, consumed = _pipeline_counts(state, chunks)
@@ -943,7 +954,7 @@ def _wait_for_pipeline_capacity(
             return state
         if time.monotonic() >= deadline:
             raise ProtocolError("timed out waiting for NAS to consume an S3 chunk")
-        time.sleep(delay)
+        _download_pause(delay, cancel_event)
         delay = min(1.0, delay * 1.4)
 
 
@@ -1250,7 +1261,10 @@ def upload(
     destination_mtime_ns: Optional[int] = None,
     source_identity: Optional[Tuple[int, int, int, int]] = None,
     resume: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
+    _check_upload_cancelled(cancel_event)
     source = Path(local_source)
     if not source.is_file():
         raise Nass3cpError("local source is not a regular file: %s" % source)
@@ -1271,6 +1285,8 @@ def upload(
         before.st_mtime_ns if destination_mtime_ns is None else destination_mtime_ns
     )
     if resume:
+        if progress_callback is not None or cancel_event is not None:
+            raise ValueError("upload callbacks require pipeline mode")
         if compression is not None:
             raise ValueError("resumable single-file uploads cannot use compression")
         _resumable_upload(
@@ -1316,8 +1332,9 @@ def upload(
             raise ProtocolError("server returned a different inflight limit")
         _pipeline_counts(state, chunks)
     committed = False
-    progress = _ProgressDisplay(not quiet)
+    progress = _ProgressDisplay(not quiet, callback=progress_callback)
     try:
+        _check_upload_cancelled(cancel_event)
         digest = hashlib.sha256()
         progress.update("upload to S3", 0, size, force=True)
         with source.open("rb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
@@ -1335,6 +1352,7 @@ def upload(
                 active: Dict[Any, Tuple[int, bytes, str]] = {}
                 pipeline_progress = _PipelineProgress(progress, "upload to S3", size)
                 while next_index < chunks or active:
+                    _check_upload_cancelled(cancel_event)
                     capacity = inflight - (next_index - consumed)
                     launch = min(
                         max(0, capacity),
@@ -1361,8 +1379,9 @@ def upload(
                                 item,
                                 data,
                                 progress=None
-                                if quiet
+                                if quiet and progress_callback is None
                                 else pipeline_progress.callback(index),
+                                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
                             )
                             active[future] = (index, data, chunk_digest)
                         next_index += launch
@@ -1395,11 +1414,13 @@ def upload(
                             chunks,
                             consumed,
                             transfer_timeout,
+                            cancel_event=cancel_event,
                         )
                         _, consumed = _pipeline_counts(updated, chunks)
             else:
                 transferred = 0
                 for start in range(0, chunks, jobs):
+                    _check_upload_cancelled(cancel_event)
                     count = min(jobs, chunks - start)
                     items = api.urls(transfer_id, start, count)
                     if len(items) != count:
@@ -1427,7 +1448,8 @@ def upload(
                             "PUT",
                             item,
                             payload,
-                            progress=None if quiet else batch_progress.callback(offset),
+                            progress=None if quiet and progress_callback is None else batch_progress.callback(offset),
+                            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
                         )
                         for offset, (item, payload) in enumerate(zip(items, payloads))
                     ]
@@ -1445,6 +1467,10 @@ def upload(
                 or after.st_mtime_ns != opened.st_mtime_ns
             ):
                 raise Nass3cpError("local source changed during transfer")
+        _check_upload_cancelled(cancel_event)
+        if progress_callback is not None:
+            progress_callback("verify upload", size, size)
+        _check_upload_cancelled(cancel_event)
         committed = True
         if decoded_digest is None:
             api.commit(transfer_id, digest.hexdigest())
@@ -1458,10 +1484,12 @@ def upload(
             quiet,
             progress,
             "copy from S3 to NAS",
+            cancel_event=cancel_event,
         )
     except (Exception, KeyboardInterrupt):
-        if not committed:
+        if not committed or cancel_event is not None and cancel_event.is_set():
             api.abort(transfer_id)
+        _check_upload_cancelled(cancel_event)
         raise
     finally:
         progress.close()

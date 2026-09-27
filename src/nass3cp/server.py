@@ -1617,7 +1617,10 @@ class ServerApp:
                 self._remove_upload_temporary(state)
                 self._remove_download_temporary(state)
                 if not state.get("objects_cleaned"):
-                    self._cleanup_state_objects(state)
+                    if not self._cleanup_state_objects(state):
+                        # Keep the persisted object locations for the next sweep,
+                        # including after a restart. Never forget failed deletes.
+                        continue
                 self.store.remove(transfer_id)
 
     def stop(self) -> None:
