@@ -1,5 +1,6 @@
 :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; color: #1c293a; background: #f5f7fa; font-size: 14px; }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; }
 a { color: #176552; text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -67,6 +68,28 @@ time { font-size: 12px; color: #536176; font-variant-numeric: tabular-nums; }
 #search-percent { color: #536176; font-size: 12px; font-variant-numeric: tabular-nums; }
 #search-cancel, #search-close { color: #344459; background: #fff; border-color: #dce2e8; }
 button:disabled { opacity: .5; cursor: default; }
+.secondary { color: #344459; background: #fff; border-color: #dce2e8; }
+.secondary:hover { background: #f0f5f3; }
+.file-select, .select-all, .selection-spacer { display: inline-block; width: 14px; height: 14px; margin: 0 9px 0 0; padding: 0; vertical-align: -2px; accent-color: #176552; flex: none; }
+.selection-bar { padding: 7px 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; border-bottom: 1px solid #edf0f3; font-size: 12px; }
+.selection-bar .note { margin: 0 0 0 auto; }
+#selection-count { font-variant-numeric: tabular-nums; }
+#download-error { margin: 0; padding: 8px 12px; color: #9a4135; background: #fff8f6; overflow-wrap: anywhere; font-size: 12px; }
+.downloads { margin-top: 12px; border: 1px solid #dce2e8; border-radius: 10px; background: #fff; overflow: hidden; }
+.download-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 9px 12px; }
+.download-heading h2 { margin: 0; font-size: 14px; font-weight: 650; }
+#download-summary { color: #667386; font-size: 12px; }
+.download-scroll { max-height: 310px; }
+.downloads thead { position: sticky; top: 0; z-index: 1; }
+.downloads th:first-child { width: 32%; }
+.download-path { font-size: 11px; color: #667386; margin-top: 2px; overflow-wrap: anywhere; }
+.downloads td.download-status { min-width: 130px; white-space: normal; }
+.download-problem { font-size: 11px; color: #9a4135; margin-top: 3px; overflow-wrap: anywhere; max-width: 320px; }
+.download-meter { min-width: 150px; }
+.download-meter progress { display: block; width: 100%; max-width: 260px; height: 6px; margin-bottom: 4px; accent-color: #176552; }
+.download-bytes { font-size: 11px; font-variant-numeric: tabular-nums; color: #667386; }
+.download-actions > :not([hidden]) + :not([hidden]) { margin-left: 6px; }
+.download-hint { padding: 7px 12px; margin: 0; border-top: 1px solid #edf0f3; }
 #search-bar { flex: 1; min-width: 60px; height: 8px; accent-color: #176552; }
 #search-counts { font-size: 12px; color: #536176; line-height: 1.5; margin: 0 0 4px; }
 #search-current, #search-scope { overflow-wrap: anywhere; }
@@ -85,4 +108,5 @@ button:disabled { opacity: .5; cursor: default; }
   #search-pattern { flex-basis: 100%; }
   .search-options { margin-right: auto; }
   #search-close { padding: 5px 7px; font-size: 12px; }
+  .selection-bar .note { flex-basis: 100%; }
 }

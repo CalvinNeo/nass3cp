@@ -1,4 +1,4 @@
-"""A read-only, loopback-only browser for NAS directory metadata."""
+"""A loopback-only NAS browser with verified, per-file downloads."""
 
 import hmac
 import html
@@ -16,10 +16,11 @@ from importlib import resources
 from string import Template
 from typing import Any, Dict, Mapping, Optional
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 from .client import ApiClient, _human_bytes, list_remote_page
-from .errors import AuthenticationError, Nass3cpError
+from .downloads import DownloadError, DownloadManager
+from .errors import AuthenticationError, DownloadCancelled, Nass3cpError
 
 
 PAGE_SIZE = 100
@@ -76,6 +77,12 @@ def _render(
         name = entry["name"]
         kind = entry["type"]
         name_html = '<bdi>%s</bdi>' % _escape(name)
+        selection = '<span class="selection-spacer" aria-hidden="true"></span>'
+        if kind == "file":
+            selection = '<input type="checkbox" class="file-select" data-file-path="%s" aria-label="%s">' % (
+                _escape(json.dumps(posixpath.join(current, name), ensure_ascii=True)),
+                _escape("Select " + name),
+            )
         if kind == "directory":
             name_html = '<a href="%s">%s<span aria-hidden="true"> /</span></a>' % (
                 _escape(_url(posixpath.join(current, name))), name_html,
@@ -86,9 +93,9 @@ def _render(
             if size is not None else '<span class="unavailable">—</span>'
         )
         rows.append(
-            '<tr><td class="name"><span class="icon %s" aria-hidden="true"></span>%s</td>'
+            '<tr><td class="name">%s<span class="icon %s" aria-hidden="true"></span>%s</td>'
             '<td>%s</td><td class="size">%s</td><td>%s</td><td>%s</td></tr>'
-            % (kind, name_html, _KINDS[kind], size_html,
+            % (selection, kind, name_html, _KINDS[kind], size_html,
                _timestamp(entry.get("birthtime_ns")), _timestamp(entry["mtime_ns"]))
         )
     if error is not None:
@@ -102,7 +109,7 @@ def _render(
             rows.append('<tr><td colspan="5" class="empty">%s</td></tr>' % label)
         content = (
             '<div class="table-scroll"><table><caption class="sr-only">NAS file list</caption>'
-            '<thead><tr><th scope="col">Name</th><th scope="col">Type</th>'
+            '<thead><tr><th scope="col"><input type="checkbox" class="select-all" aria-label="Select visible files">Name</th><th scope="col">Type</th>'
             '<th scope="col" class="size">Size</th><th scope="col">Created</th>'
             '<th scope="col">Modified</th></tr></thead><tbody>%s</tbody></table></div>'
         ) % "".join(rows)
@@ -130,7 +137,9 @@ class BrowserServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, api: ApiClient, initial_path: str, port: int = 8765):
+    def __init__(self, api: ApiClient, initial_path: str, port: int = 8765,
+                 download_concurrency: int = 1, jobs: int = 2, inflight: int = 3,
+                 transfer_timeout: int = 86400):
         self.api = api
         self.initial_path = initial_path
         self.launch_token = secrets.token_urlsafe(32)
@@ -139,6 +148,8 @@ class BrowserServer(ThreadingHTTPServer):
         self.template = Template(resources.read_text("nass3cp", "browse.html", encoding="utf-8"))
         self.stylesheet = resources.read_binary("nass3cp", "browse.css")
         self.search_script = resources.read_binary("nass3cp", "browse.js")
+        self.download_script = resources.read_binary("nass3cp", "downloads.js")
+        self.downloads = DownloadManager(api.clone, download_concurrency, jobs, inflight, transfer_timeout)
         self.search_ids = set()  # type: set
         self.active_search_ids = set()  # type: set
         super().__init__(("127.0.0.1", port), BrowserHandler)
@@ -150,6 +161,7 @@ class BrowserServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         try:
+            self.downloads.stop()
             with self.api_lock:
                 for identifier in self.active_search_ids:
                     try:
@@ -182,9 +194,14 @@ class BrowserHandler(BaseHTTPRequestHandler):
         self, status: int, body: bytes, content_type: str = "text/html; charset=utf-8",
         headers: Optional[Dict[str, str]] = None,
     ) -> None:
+        self._headers(status, len(body), content_type, headers)
+        self.wfile.write(body)
+
+    def _headers(self, status: int, length: int, content_type: str,
+                 headers: Optional[Dict[str, str]] = None) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(length))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -197,7 +214,34 @@ class BrowserHandler(BaseHTTPRequestHandler):
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+
+    def _download_file(self, identifier: str) -> None:
+        item, handle = self.browser.downloads.open_file(identifier)
+        complete = False
+        try:
+            with handle:
+                fallback = "download" + posixpath.splitext(item.name)[1].encode("ascii", "ignore").decode("ascii")
+                self._headers(200, item.total, "application/octet-stream", {
+                    "Content-Disposition": 'attachment; filename="%s"; filename*=UTF-8\'\'%s' % (
+                        fallback, quote(item.name, safe="")),
+                    "Accept-Ranges": "none",
+                })
+                sent = 0
+                while True:
+                    if item.cancelled.is_set():
+                        raise DownloadCancelled("Download cancelled")
+                    block = handle.read(1024 * 1024)
+                    if not block:
+                        break
+                    self.wfile.write(block)
+                    sent += len(block)
+                    self.browser.downloads.sent_bytes(item, sent)
+                self.wfile.flush()
+                complete = sent == item.total
+        except (DownloadCancelled, OSError):
+            pass  # Closing a native browser download leaves a retryable save link.
+        finally:
+            self.browser.downloads.finish_sending(item, complete)
 
     def _message(self, status: int, message: str) -> None:
         self._send(status, message.encode("utf-8"), "text/plain; charset=utf-8")
@@ -216,17 +260,28 @@ class BrowserHandler(BaseHTTPRequestHandler):
         if not self._authenticated():
             self._message(403, "Open the full browser URL shown in the terminal.")
             return
-        # A custom header plus same-origin checks prevent cross-site search starts.
-        if self.headers.get("X-Nass3cp-Request") != "search" or self.headers.get_content_type() != "application/json":
-            self._json(403, {"error": "Search requests must come from this page."})
+        # Custom headers and same-origin checks protect all actions, including downloads.
+        is_download = self.path.startswith("/api/downloads")
+        if (self.headers.get("X-Nass3cp-Request") != ("download" if is_download else "search")
+                or self.headers.get_content_type() != "application/json"):
+            self._json(403, {"error": "Requests must come from this page."})
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= length <= 16384:
+            if not 1 <= length <= (2 * 1024 * 1024 if is_download else 16384):
                 raise ValueError("invalid request length")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("invalid request body")
+            if is_download:
+                if self.path == "/api/downloads":
+                    self._json(202, self.browser.downloads.enqueue(body))
+                else:
+                    match = re.fullmatch(r"/api/downloads/([0-9a-f]{32})/cancel", self.path)
+                    if not match:
+                        raise DownloadError(404, "Download endpoint not found.")
+                    self._json(200, self.browser.downloads.cancel(match.group(1)))
+                return
             with self.browser.api_lock:
                 if self.path == "/api/searches":
                     value = self.browser.api.start_search(
@@ -251,7 +306,9 @@ class BrowserHandler(BaseHTTPRequestHandler):
                     value = self.browser.api.cancel_search(match.group(1))
                 self._json(200, value)
         except (ValueError, UnicodeError):
-            self._json(400, {"error": "Invalid search request."})
+            self._json(400, {"error": "Invalid request."})
+        except DownloadError as exc:
+            self._json(exc.status, {"error": str(exc)})
         except (Nass3cpError, OSError) as exc:
             self._search_error(exc)
 
@@ -314,6 +371,19 @@ class BrowserHandler(BaseHTTPRequestHandler):
         if parsed.path == "/browse.js":
             self._send(200, self.browser.search_script, "text/javascript; charset=utf-8")
             return
+        if parsed.path == "/downloads.js":
+            self._send(200, self.browser.download_script, "text/javascript; charset=utf-8")
+            return
+        if parsed.path == "/api/downloads":
+            self._json(200, self.browser.downloads.state())
+            return
+        match = re.fullmatch(r"/api/downloads/([0-9a-f]{32})/file", parsed.path)
+        if match:
+            try:
+                self._download_file(match.group(1))
+            except DownloadError as exc:
+                self._json(exc.status, {"error": str(exc)})
+            return
         match = re.fullmatch(r"/api/searches/([0-9a-f]{32})", parsed.path)
         if match:
             try:
@@ -357,10 +427,12 @@ class BrowserHandler(BaseHTTPRequestHandler):
             self._send(502, _render(self.browser, path, cursor, error=str(exc)))
 
 
-def run_browser(api: ApiClient, path: str, port: int = 8765, open_browser: bool = True) -> None:
+def run_browser(api: ApiClient, path: str, port: int = 8765, open_browser: bool = True,
+                download_concurrency: int = 1, jobs: int = 2, inflight: int = 3,
+                transfer_timeout: int = 86400) -> None:
     # Authenticate and validate the starting directory before listening locally.
     list_remote_page(api, path, page_size=PAGE_SIZE)
-    with BrowserServer(api, path, port) as server:
+    with BrowserServer(api, path, port, download_concurrency, jobs, inflight, transfer_timeout) as server:
         print("NAS file browser: %s" % server.url, flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         if open_browser:

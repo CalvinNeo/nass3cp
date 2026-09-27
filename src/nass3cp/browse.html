@@ -6,6 +6,7 @@
   <title>File browser · nass3cp</title>
   <link rel="stylesheet" href="/browse.css">
   <script src="/browse.js" defer></script>
+  <script src="/downloads.js" defer></script>
 </head>
 <body>
   <header class="app-header">
@@ -57,11 +58,18 @@
           </details>
           <p id="search-error" role="alert" hidden></p>
         </div>
-        <noscript>Enable JavaScript to search files and view live progress.</noscript>
+        <noscript>Enable JavaScript to search, select files and view download progress.</noscript>
       </section>
+      <div class="selection-bar">
+        <span id="selection-count">0 files selected</span>
+        <button id="download-selected" type="button" disabled>Download selected</button>
+        <button id="selection-clear" class="secondary" type="button" disabled>Clear selection</button>
+        <span class="note">Files only · Selection kept across folders and pages</span>
+      </div>
+      <p id="download-error" role="alert" hidden></p>
       <section id="search-results" aria-label="Search results" hidden>
         <div class="table-scroll"><table>
-          <thead><tr><th scope="col">Name / Location</th><th scope="col" class="size">Size</th><th scope="col">Created</th><th scope="col">Modified</th></tr></thead>
+          <thead><tr><th scope="col"><input type="checkbox" class="select-all" aria-label="Select visible search results">Name / Location</th><th scope="col" class="size">Size</th><th scope="col">Created</th><th scope="col">Modified</th></tr></thead>
           <tbody id="search-rows"></tbody>
         </table></div>
         <p id="search-empty" class="empty">Waiting for results…</p>
@@ -70,6 +78,14 @@
         $content
         <footer class="list-footer"><span>$summary</span><nav class="actions" aria-label="Pagination">$pagination</nav></footer>
       </div>
+    </section>
+    <section id="downloads" class="downloads" aria-label="Downloads" hidden>
+      <div class="download-heading"><h2>Downloads</h2><span id="download-summary"></span></div>
+      <div class="table-scroll download-scroll"><table>
+        <thead><tr><th scope="col">File</th><th scope="col">Status</th><th scope="col">Progress</th><th scope="col">Actions</th></tr></thead>
+        <tbody id="download-rows"></tbody>
+      </table></div>
+      <p class="download-hint note">Files are verified before saving. Allow multiple downloads in your browser, or click Save file. Ready files hold a queue slot for up to 10 minutes. Check your browser for the final save status.</p>
     </section>
     <details class="view-help">
       <summary>About this view</summary>

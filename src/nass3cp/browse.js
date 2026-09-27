@@ -77,6 +77,12 @@
       const row = document.createElement("tr");
       const name = row.insertCell();
       name.className = "name";
+      const select = document.createElement("input");
+      select.type = "checkbox";
+      select.className = "file-select";
+      select.dataset.filePath = JSON.stringify(item.path);
+      select.setAttribute("aria-label", "Select " + item.name);
+      name.appendChild(select);
       const title = document.createElement("bdi");
       title.textContent = item.name;
       name.appendChild(title);
@@ -95,6 +101,7 @@
     }
     cursor += items.length;
     empty.hidden = cursor > 0;
+    document.dispatchEvent(new Event("nass3cp:files-changed"));
   }
 
   function render(data) {
@@ -173,6 +180,7 @@
     empty.textContent = "Waiting for results…";
     progress.hidden = results.hidden = false;
     directory.hidden = true;
+    document.dispatchEvent(new Event("nass3cp:files-changed"));
     start.disabled = true;
     cancel.disabled = true;
     close.disabled = true;
@@ -235,6 +243,7 @@
       remember(null);
       progress.hidden = results.hidden = true;
       directory.hidden = false;
+      document.dispatchEvent(new Event("nass3cp:files-changed"));
       start.disabled = false;
       cancel.disabled = true;
     } catch (problem) {

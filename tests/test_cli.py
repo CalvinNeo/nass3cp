@@ -201,7 +201,28 @@ class CliTests(unittest.TestCase):
                 "--host", "nas.example", "--token", "password", "--web-port", "0",
                 "--no-browser", "browse", "nas:/share/中文 文件",
             ])
-        browse.assert_called_once_with(api, "/share/中文 文件", port=0, open_browser=False)
+        browse.assert_called_once_with(api, "/share/中文 文件", port=0, open_browser=False,
+                                       download_concurrency=1, jobs=2, inflight=3, transfer_timeout=86400)
+
+    def test_browser_download_concurrency_default_environment_and_override(self):
+        for env, flags, expected in (({}, [], 1), ({"NASS3CP_DOWNLOAD_CONCURRENCY": "2"}, [], 2),
+                ({"NASS3CP_DOWNLOAD_CONCURRENCY": "bad"}, ["--download-concurrency", "3"], 3)):
+            with self.subTest(env=env, flags=flags), patch.dict(os.environ, env, clear=True):
+                args = build_parser().parse_args(["--host", "nas.example", "browse"] + flags)
+                _validate_browse_args(args)
+                self.assertEqual(args.download_concurrency, expected)
+        for value in ("0", "9", "bad", "1.5", ""):
+            with self.subTest(value=value), patch.dict(os.environ, {"NASS3CP_DOWNLOAD_CONCURRENCY": value}), self.assertRaises(Nass3cpError):
+                args = build_parser().parse_args(["--host", "nas.example", "browse"])
+                _validate_browse_args(args)
+
+    def test_browse_forwards_file_and_chunk_concurrency(self):
+        api = Mock()
+        with patch("nass3cp.cli.ApiClient", return_value=api), patch("nass3cp.cli.run_browser") as browse:
+            main(["--host", "nas.example", "--token", "password", "--download-concurrency", "2",
+                  "--jobs", "4", "--inflight", "5", "--transfer-timeout", "120", "browse"])
+        browse.assert_called_once_with(api, ".", port=8765, open_browser=True,
+                                       download_concurrency=2, jobs=4, inflight=5, transfer_timeout=120)
 
     def test_browse_rejects_invalid_options_before_connecting(self):
         for arguments in (
@@ -210,6 +231,9 @@ class CliTests(unittest.TestCase):
             ["browse", "--mode", "parallel"], ["browse", "--web-port", "65536"],
             ["browse", "--web-port", "-1"], ["ls", "nas:", "--web-port", "8765"],
             ["source.bin", "nas:dest.bin", "--no-browser"],
+            ["browse", "--download-concurrency", "0"], ["browse", "--download-concurrency", "9"],
+            ["ls", "nas:", "--download-concurrency", "2"],
+            ["source.bin", "nas:dest.bin", "--download-concurrency", "2"],
         ):
             with self.subTest(arguments=arguments), patch("nass3cp.cli.ApiClient") as api, patch(
                 "nass3cp.cli.getpass.getpass"
@@ -229,7 +253,8 @@ class CliTests(unittest.TestCase):
         ) as browse, patch("nass3cp.cli.getpass.getpass") as prompt:
             main(["--host", "nas.example", "browse"])
         api.check_authenticated.assert_called_once_with()
-        browse.assert_called_once_with(api, ".", port=8765, open_browser=True)
+        browse.assert_called_once_with(api, ".", port=8765, open_browser=True,
+                                       download_concurrency=1, jobs=2, inflight=3, transfer_timeout=86400)
         prompt.assert_not_called()
 
     def test_recursive_dry_upload_is_routed_with_selected_policy(self):

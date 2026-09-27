@@ -184,6 +184,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-browser", action="store_true",
         help="browse: print the local URL without opening a browser",
     )
+    parser.add_argument(
+        "--download-concurrency", type=int,
+        help="browse: concurrent file downloads (1-8; default: NASS3CP_DOWNLOAD_CONCURRENCY or 1)",
+    )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument(
         "src",
@@ -211,6 +215,8 @@ def _validate_common_args(args: argparse.Namespace) -> None:
         raise Nass3cpError("--web-port must be between 0 and 65535")
     if (args.web_port is not None or args.no_browser) and args.src != "browse":
         raise Nass3cpError("--web-port and --no-browser require browse")
+    if args.download_concurrency is not None and args.src != "browse":
+        raise Nass3cpError("--download-concurrency requires browse")
 
 
 def _validate_args(args: argparse.Namespace) -> Tuple[Optional[str], Optional[str]]:
@@ -255,6 +261,15 @@ def _validate_ls_args(args: argparse.Namespace) -> str:
 
 def _validate_browse_args(args: argparse.Namespace) -> str:
     _validate_common_args(args)
+    try:
+        concurrency = args.download_concurrency
+        if concurrency is None:
+            concurrency = int(os.environ.get("NASS3CP_DOWNLOAD_CONCURRENCY", "1"))
+    except ValueError as exc:
+        raise Nass3cpError("NASS3CP_DOWNLOAD_CONCURRENCY must be an integer between 1 and 8") from exc
+    if not 1 <= concurrency <= 8:
+        raise Nass3cpError("--download-concurrency must be between 1 and 8")
+    args.download_concurrency = concurrency
     if args.recursive or args.dry or args.mode == "parallel" or args.overwrite:
         raise Nass3cpError(
             "browse cannot be combined with --recursive, --dry, --mode parallel, or --overwrite"
@@ -394,6 +409,8 @@ def main(argv: Optional[List[str]] = None) -> None:
                 api, browse_path,
                 port=args.web_port if args.web_port is not None else 8765,
                 open_browser=not args.no_browser,
+                download_concurrency=args.download_concurrency, jobs=args.jobs,
+                inflight=args.inflight, transfer_timeout=args.transfer_timeout,
             )
         elif list_path is not None:
             _print_directory(list_remote(api, list_path))

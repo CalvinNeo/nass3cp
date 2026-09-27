@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import json
 import os
@@ -17,7 +18,7 @@ from urllib.parse import urlsplit
 from urllib.request import Request
 
 from .compression import DecodingWriter
-from .errors import AuthenticationError, Nass3cpError, ProtocolError
+from .errors import AuthenticationError, DownloadCancelled, Nass3cpError, ProtocolError
 from .net import secure_opener
 
 
@@ -25,6 +26,18 @@ _DATA_OPENERS = threading.local()
 _PROGRESS_REPORT_BYTES = 256 * 1024
 _RESUME_VERSION = 1
 _RESUME_FILE_LIMIT = 16 * 1024 * 1024
+
+
+def _check_download_cancelled(event: Optional[threading.Event]) -> None:
+    if event is not None and event.is_set():
+        raise DownloadCancelled("Download cancelled")
+
+
+def _download_pause(seconds: float, event: Optional[threading.Event]) -> None:
+    if event is None:
+        time.sleep(seconds)
+    elif event.wait(seconds):
+        raise DownloadCancelled("Download cancelled")
 
 
 def _human_bytes(value: float) -> str:
@@ -49,8 +62,10 @@ def _human_duration(seconds: float) -> str:
 
 
 class _ProgressDisplay:
-    def __init__(self, enabled: bool, stream: Optional[TextIO] = None):
+    def __init__(self, enabled: bool, stream: Optional[TextIO] = None,
+                 callback: Optional[Callable[[str, int, int], None]] = None):
         self.enabled = enabled
+        self.callback = callback
         self.stream = stream if stream is not None else sys.stderr
         try:
             self.is_terminal = bool(self.stream.isatty())
@@ -91,6 +106,8 @@ class _ProgressDisplay:
         return line
 
     def update(self, label: str, completed: int, total: int, force: bool = False) -> None:
+        if self.callback is not None:
+            self.callback(label, completed, total)
         if not self.enabled:
             return
         total = max(0, int(total))
@@ -267,6 +284,12 @@ class ApiClient:
             self.context = ssl.create_default_context(cafile=ca_file)
         self.context.minimum_version = ssl.TLSVersion.TLSv1_2
         self.opener = secure_opener(self.context)
+
+    def clone(self) -> "ApiClient":
+        """Give a transfer worker its own opener while preserving TLS settings."""
+        result = copy.copy(self)
+        result.opener = secure_opener(self.context)
+        return result
 
     def request(self, method: str, path: str, body: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         data = None
@@ -555,6 +578,7 @@ def _data_request(
     expected: Optional[int] = None,
     attempts: int = 4,
     progress: Optional[Callable[[int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> bytes:
     url = item.get("url")
     headers = item.get("headers", {})
@@ -596,6 +620,7 @@ def _data_request(
 
     last_error: Optional[Exception] = None
     for attempt in range(attempts):
+        _check_download_cancelled(cancel_event)
         if progress is not None:
             progress(0)
         request_data: Any = data
@@ -603,12 +628,13 @@ def _data_request(
             request_data = _ProgressReader(data or b"", progress)
         request = Request(url, data=request_data, headers=clean_headers, method=method)
         try:
-            response = _data_opener().open(request, timeout=300)
+            response = _data_opener().open(request, timeout=30 if cancel_event is not None else 300)
             try:
                 if method == "GET":
                     parts = []
                     downloaded = 0
                     while True:
+                        _check_download_cancelled(cancel_event)
                         read_size = _PROGRESS_REPORT_BYTES
                         if expected is not None:
                             remaining = expected + 1 - downloaded
@@ -647,7 +673,7 @@ def _data_request(
         except (URLError, OSError, HTTPException, ProtocolError) as exc:
             last_error = exc
         if attempt + 1 < attempts:
-            time.sleep(min(8.0, 0.5 * (2 ** attempt)))
+            _download_pause(min(8.0, 0.5 * (2 ** attempt)), cancel_event)
     raise ProtocolError("S3 %s failed after %d attempts: %s" % (method, attempts, last_error))
 
 
@@ -844,11 +870,13 @@ def wait_for_state(
     quiet: bool,
     progress: Optional[_ProgressDisplay] = None,
     progress_label: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + timeout
     last_line: Optional[str] = None
     delay = 0.5
     while True:
+        _check_download_cancelled(cancel_event)
         state = api.state(transfer_id)
         status = state.get("status")
         line = _status_line(state)
@@ -870,7 +898,7 @@ def wait_for_state(
             raise ProtocolError("server returned unknown transfer state: %r" % status)
         if time.monotonic() >= deadline:
             raise ProtocolError("timed out waiting for NAS transfer")
-        time.sleep(delay)
+        _download_pause(delay, cancel_event)
         delay = min(1.0, delay * 1.4)
 
 
@@ -925,10 +953,12 @@ def _wait_for_pipeline_chunk(
     chunks: int,
     index: int,
     timeout: int,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     deadline = time.monotonic() + timeout
     delay = 0.1
     while True:
+        _check_download_cancelled(cancel_event)
         state = api.state(transfer_id)
         _check_pipeline_state(state, ("preparing", "ready"))
         staged, consumed = _pipeline_counts(state, chunks)
@@ -940,7 +970,7 @@ def _wait_for_pipeline_chunk(
             raise ProtocolError("NAS finished producing before the next chunk became available")
         if time.monotonic() >= deadline:
             raise ProtocolError("timed out waiting for the next NAS chunk")
-        time.sleep(delay)
+        _download_pause(delay, cancel_event)
         delay = min(1.0, delay * 1.4)
 
 
@@ -1782,7 +1812,10 @@ def download(
     inflight: int = 3,
     compression: Optional[str] = None,
     resume: bool = False,
+    progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> None:
+    _check_download_cancelled(cancel_event)
     destination = _local_destination(remote_source, local_destination)
     if not destination.parent.is_dir():
         raise Nass3cpError("local destination directory does not exist: %s" % destination.parent)
@@ -1795,6 +1828,8 @@ def download(
             raise Nass3cpError("local destination exists; use --overwrite: %s" % destination)
 
     if resume:
+        if progress_callback is not None or cancel_event is not None:
+            raise ValueError("download callbacks require pipeline mode")
         if compression is not None:
             raise ValueError("resumable single-file downloads cannot use compression")
         _resumable_download(
@@ -1808,7 +1843,7 @@ def download(
         )
         return
 
-    progress = _ProgressDisplay(not quiet)
+    progress = _ProgressDisplay(not quiet, callback=progress_callback)
     if compression is None:
         initial = api.create_download(remote_source, inflight)
     else:
@@ -1860,6 +1895,7 @@ def download(
                 quiet,
                 progress,
                 "copy from NAS to S3",
+                cancel_event=cancel_event,
             )
             ready = True
         fd, temporary = tempfile.mkstemp(
@@ -1869,8 +1905,8 @@ def download(
         )
         transferred = 0
         progress_label = "copy from NAS via S3" if pipeline else "download from S3"
-        progress.update(progress_label, 0, size, force=True)
         with os.fdopen(fd, "wb") as handle, ThreadPoolExecutor(max_workers=jobs) as executor:
+            progress.update(progress_label, 0, size, force=True)
             sink = DecodingWriter(handle, wire_compression, decoded_size)
             next_request = 0
             next_write = 0
@@ -1885,6 +1921,7 @@ def download(
                 staged = chunks
 
             while next_write < chunks:
+                _check_download_cancelled(cancel_event)
                 # Keep both network workers and buffered out-of-order results bounded
                 # by --jobs. As the NAS stages new chunks, free worker slots are
                 # filled without waiting for the current batch to finish.
@@ -1920,8 +1957,9 @@ def download(
                             None,
                             expected,
                             progress=None
-                            if quiet
+                            if quiet and progress_callback is None
                             else download_progress.callback(index),
+                            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
                         )
                         active[future] = (index, expected_digest)
                     next_request += launch
@@ -1982,6 +2020,7 @@ def download(
                         chunks,
                         next_request,
                         transfer_timeout,
+                        cancel_event=cancel_event,
                     )
                     staged, _ = _pipeline_counts(state, chunks)
                     continue
@@ -1997,7 +2036,11 @@ def download(
                 ("ready",),
                 transfer_timeout,
                 True,
+                cancel_event=cancel_event,
             )
+        _check_download_cancelled(cancel_event)
+        if progress_callback is not None:
+            progress_callback("verify download", transferred, size)
         remote_digest = state.get("sha256")
         if (
             not isinstance(remote_digest, str)

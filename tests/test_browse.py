@@ -178,6 +178,39 @@ class BrowserTests(unittest.TestCase):
         self.assertIn("@media", body)
         self.api.list_directory.assert_not_called()
 
+    def test_only_regular_files_can_be_selected_in_the_list(self):
+        self.login()
+        status, _, body = self.request()
+        self.assertEqual(status, 200)
+        self.assertEqual(body.count('class="file-select"'), 1)
+        self.assertIn('aria-label="Select movie.mp4"', body)
+        self.assertIn('data-file-path="&quot;/share/movie.mp4&quot;"', body)
+        self.assertIn("Download selected", body)
+        self.assertIn('aria-label="Downloads"', body)
+
+    def test_download_actions_and_files_require_the_local_session(self):
+        headers = {"Content-Type": "application/json", "X-Nass3cp-Request": "download"}
+        body = json.dumps({"paths": ["/share/movie.mp4"]})
+        identifier = "a" * 32
+        for path in ("/api/downloads", "/api/downloads/" + identifier + "/file"):
+            self.assertEqual(self.request(path)[0], 403)
+        self.assertEqual(self.request("/api/downloads", headers, "POST", body)[0], 403)
+        self.login()
+        with patch.object(self.server.downloads, "enqueue", return_value={"items": [], "concurrency": 1}) as enqueue:
+            for invalid_headers in ({}, dict(headers, Origin="https://attacker.test"),
+                                    dict(headers, **{"Sec-Fetch-Site": "cross-site"}),
+                                    dict(headers, **{"X-Nass3cp-Request": "search"})):
+                self.assertEqual(self.request("/api/downloads", invalid_headers, "POST", body)[0], 403)
+            enqueue.assert_not_called()
+            self.assertEqual(self.request("/api/downloads", headers, "POST", body)[0], 202)
+            enqueue.assert_called_once_with({"paths": ["/share/movie.mp4"]})
+        self.assertEqual(self.request("/api/downloads/" + identifier + "/file")[0], 404)
+        self.assertEqual(self.request("/api/downloads/" + identifier + "/cancel", headers, "POST", "{}")[0], 404)
+        self.assertEqual(self.request("/api/downloads", headers, "POST", "[]")[0], 400)
+        self.assertEqual(json.loads(self.request("/api/downloads")[2]), {"items": [], "concurrency": 1})
+        self.assertEqual(self.request("/downloads.js")[0], 200)
+        self.assertEqual(self.api.mock_calls, [])
+
     def test_search_proxy_requires_session_and_same_origin_json_requests(self):
         identifier = "a" * 32
         body = json.dumps({"path": "/share", "pattern": "报告.*", "regex": True})

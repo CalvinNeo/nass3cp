@@ -1,59 +1,59 @@
-# Cloudflare R2 配置指南
+# Cloudflare R2 Setup Guide
 
-这份配置让 `nass3cp` 使用私有 Cloudflare R2 Bucket 作为临时中转。程序使用 R2 的 S3 兼容接口和 SigV4 预签名 URL；NAS 与客户端不需要安装 Cloudflare SDK。
+This setup uses a private Cloudflare R2 bucket as a temporary relay for `nass3cp`. The program uses R2's S3-compatible API and SigV4 presigned URLs. Neither the NAS nor the client needs the Cloudflare SDK.
 
-## 1. 开通 R2
+## 1. Enable R2
 
-1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)，进入 **R2 Object Storage**。
-2. 按页面提示开通 R2。Cloudflare 要求先开通计费，即使实际用量完全落在免费额度内。
-3. 记录页面上显示的 **Account ID**；它不是密钥。
+1. Sign in to the [Cloudflare Dashboard](https://dash.cloudflare.com/) and open **R2 Object Storage**.
+2. Follow the prompts to enable R2. Cloudflare requires billing to be enabled even if your usage stays entirely within the free tier.
+3. Record the **Account ID** displayed on the page; it is not a secret.
 
-R2 Standard 当前每月包含 10 GB-month 存储、100 万次 Class A 操作和 1000 万次 Class B 操作，直接从 R2 经 S3 API 流出不收公网流量费。免费额度只适用于 Standard，不要把这个临时 Bucket 设成 Infrequent Access。
+R2 Standard's monthly free tier includes 10 GB-month of storage, one million Class A operations, and ten million Class B operations. Direct egress from R2 through the S3 API has no internet bandwidth charge. The free tier applies only to Standard; do not use Infrequent Access for this temporary bucket.
 
-客户端默认使用 `--mode pipeline --inflight 3` 的有界流水线。发送方最多向 R2 放入三个尚未确认的分块；接收方逐块校验、落盘并成功删除 R2 对象后，发送方才会继续。默认 64 MiB 分块下，单个正常传输的云端峰值约为 192 MiB；同时运行多个复制进程时，各自的窗口会叠加。可以在客户端命令中调整 `--inflight`，降低它会减少云端峰值但可能降低吞吐，提高它则相反。
+The client defaults to a bounded pipeline with `--mode pipeline --inflight 3`. The sender keeps at most three unacknowledged chunks in R2. It continues as the receiver verifies each chunk, writes it to disk, and successfully deletes the R2 object. With the default 64 MiB chunks, one normal transfer peaks at about 192 MiB of cloud storage. Multiple copy processes each have their own window, so their usage adds up. Adjust `--inflight` in the client command: lowering it reduces peak storage but may lower throughput; increasing it has the opposite effect.
 
-单文件使用 `--mode parallel` 时，所有未完成块独立调度，实际同时执行的客户端 S3 请求仍由 `--jobs` 限制，`--inflight` 不参与控制。为了能在下一次只补传或补取缺失块，已完成对象会保留到整文件成功或 `transfer_ttl_seconds` 到期，因此云端峰值最多可接近整个文件大小。续传状态默认保留 24 小时；Bucket 生命周期不要设置得比计划的续传窗口更短。`--resume` 是该模式的兼容别名。
+For single-file transfers with `--mode parallel`, all unfinished chunks are scheduled independently. `--jobs` still limits simultaneous client S3 requests, while `--inflight` does not apply. Completed objects remain until the entire file succeeds or `transfer_ttl_seconds` expires, allowing the next run to upload or download only missing chunks. Peak cloud storage can therefore approach the full file size. Resume state is retained for 24 hours by default; do not set the bucket lifecycle shorter than your intended resume window. `--resume` is a compatibility alias for this mode.
 
-递归复制仍按文件分别建立流水线，因此云端峰值保持受 `--inflight` 约束，但每个非空文件至少会产生一次 PUT、GET 和 DELETE。目录中如果有几十万甚至上百万个小文件，请特别关注 R2 的 Class A/Class B 操作次数，而不只是总字节数。默认 `--rpolicy=auto` 会先 gzip 适合压缩的后缀，并在确实变小时减少中转字节数和分块请求数；`--dry` 可先查看原始总量和预计传输文件数，它不会创建 R2 对象。
+Recursive copies create a separate pipeline for each file, so peak cloud storage remains bounded by `--inflight`. Each nonempty file still generates at least one PUT, GET, and DELETE. For directories with hundreds of thousands or millions of small files, watch R2 Class A/Class B operation counts as well as total bytes. The default `--rpolicy=auto` first gzips files with suitable extensions, reducing relay bytes and chunk requests when compression actually makes the file smaller. Use `--dry` to inspect original size totals and planned file counts without creating R2 objects.
 
-## 2. 创建专用私有 Bucket
+## 2. Create a dedicated private bucket
 
-1. 在 R2 页面选择 **Create bucket**。
-2. Bucket 名可使用 `nass3cp-relay-你的唯一后缀`；只能包含小写字母、数字和连字符。
-3. 保持默认的 **Standard** 存储；如果创建页面没有存储类型选项，无需额外设置，本项目不会发送 Infrequent Access 请求头。
-4. Location 建议选择 **Asia-Pacific (APAC)**。Location Hint 只是尽力靠近，并不保证具体国家或机房；也可以先保留 Automatic 后实测。
-5. 创建后不要启用 Public Development URL，也不需要绑定自定义域名。R2 Bucket 默认是私有的。
+1. Select **Create bucket** on the R2 page.
+2. Choose a name such as `nass3cp-relay-your-unique-suffix`, using lowercase letters, digits, and hyphens.
+3. Keep **Standard** storage. If the creation page has no storage-class option, no extra setting is needed; this project does not send an Infrequent Access request header.
+4. **Asia-Pacific (APAC)** is a suggested location. A Location Hint is best-effort and does not guarantee a particular country or data center. You can also start with Automatic and measure performance.
+5. Leave the Public Development URL disabled. No custom domain is needed. R2 buckets are private by default.
 
-Cloudflare 的 R2 令牌只能限制到 Bucket，不能进一步限制到 `nass3cp/` 前缀。因此应为本程序单独创建 Bucket，不要和备份或网站资源共用。
+R2 tokens can be restricted to a bucket, but not further to the `nass3cp/` prefix. Use a dedicated bucket for this program instead of sharing one with backups or website assets.
 
-## 3. 配置一天生命周期兜底
+## 3. Configure a one-day lifecycle fallback
 
-普通流水线传输会在成功、失败或取消后立即删除分块。`--mode parallel` 中断后会有意保留分块，成功后立即删除，过期后由服务端清理；生命周期规则还负责处理 NAS 断电或进程被强制终止等情况遗留的对象。
+Normal pipeline transfers delete chunks immediately after success, failure, or cancellation. `--mode parallel` deliberately retains chunks after interruption, deletes them after success, and relies on server cleanup after expiry. Lifecycle rules also remove objects left behind by events such as NAS power loss or forced process termination.
 
-1. 打开刚创建的 Bucket，进入 **Settings**。
-2. 在 **Object Lifecycle Rules** 下选择 **Add rule**。
-3. 新建启用状态的规则，例如 `delete-nass3cp-temp`。
-4. Prefix 填 `nass3cp/`。
-5. 操作选择在对象创建 **1 day** 后删除/过期。
-6. 保存规则，不要增加向 Infrequent Access 转换的动作。
+1. Open the new bucket and go to **Settings**.
+2. Under **Object Lifecycle Rules**, select **Add rule**.
+3. Create an enabled rule, for example `delete-nass3cp-temp`.
+4. Set the prefix to `nass3cp/`.
+5. Choose deletion/expiration **1 day** after object creation.
+6. Save the rule without adding an Infrequent Access transition.
 
-## 4. 创建最小权限 S3 凭证
+## 4. Create S3 credentials with minimum permissions
 
-1. 回到 R2 Overview。
-2. 在 **Account Details** 中找到 **API Tokens**，选择 **Manage**。
-3. 选择 **Create Account API token**。如果只有个人账号，也可以创建 User API token；Account token 更适合常驻 NAS 服务。
-4. 权限选择 **Object Read & Write**。
-5. Bucket 范围选择 **Apply to specific buckets only**，只选择刚创建的中转 Bucket。
-6. 创建令牌，并立即保存这三个值：
+1. Return to R2 Overview.
+2. Under **Account Details**, find **API Tokens** and select **Manage**.
+3. Select **Create Account API token**. A personal account can also use a User API token; an Account token is better suited to a persistent NAS service.
+4. Select **Object Read & Write** permissions.
+5. Choose **Apply to specific buckets only** and select only the relay bucket you just created.
+6. Create the token and immediately save these three values:
    - **Access Key ID**
-   - **Secret Access Key**（只显示一次）
+   - **Secret Access Key** (shown only once)
    - **Account ID**
 
-这里需要的是 R2 页面生成的 S3 Access Key，而不是 Cloudflare 其他页面使用的普通 API Token。
+Use the S3 access keys generated on the R2 page, not a general Cloudflare API token from another page.
 
-## 5. 配置 NAS
+## 5. Configure the NAS
 
-整个目录可以放在 NAS 任意位置，例如 `/volume1/apps/nass3cp`。不需要把程序安装到系统目录，也不需要创建 systemd 服务：
+Place the complete project directory anywhere on the NAS, such as `/volume1/apps/nass3cp`. No system-wide installation or systemd service is required:
 
 ```text
 nass3cp/
@@ -62,14 +62,14 @@ nass3cp/
 │   └── nass3cp-server
 ├── config/
 │   ├── server.json
-│   ├── server.env          # 从示例复制，不提交 Git
-│   └── client.env          # 可选；默认交互输入密码
+│   ├── server.env          # Copy from the example; do not commit to Git
+│   └── client.env          # Optional; the default is an interactive password prompt
 ├── src/
-├── state/                  # 首次运行自动创建
-└── run/                    # 使用 nohup 时存放日志和 PID
+├── state/                  # Created automatically on first run
+└── run/                    # Logs and PID when using nohup
 ```
 
-进入项目根目录并准备本地文件：
+Enter the project root and prepare the local files:
 
 ```bash
 cd /volume1/apps/nass3cp
@@ -78,16 +78,16 @@ chmod 700 bin/nass3cp bin/nass3cp-server
 chmod 600 config/server.env
 ```
 
-直接修改 [`config/server.json`](../config/server.json)。它默认使用密码认证且不启用应用层 TLS，不需要 CRT，并监听 `0.0.0.0:9443`。建议用 NAS 防火墙限制来源，或把 `listen` 改成 NAS 的覆盖网络虚拟 IP；仅供同机 FRP 使用时可以改成 `127.0.0.1`。
+Edit [`config/server.json`](../config/server.json) directly. It uses password authentication without application-layer TLS by default, requires no certificate, and listens on `0.0.0.0:9443`. Restrict incoming connections with the NAS firewall or set `listen` to the NAS overlay IP. Use `127.0.0.1` when only a local FRP process needs access.
 
-修改以下字段：
+Update these fields:
 
-- `s3.endpoint`：替换成 `https://ACCOUNT_ID.r2.cloudflarestorage.com`
-- `s3.bucket`：替换成第 2 步创建的 Bucket 名
-- `allowed_roots`：改成 NAS 上允许访问的真实目录
-- `state_dir`：默认是 `../state`，按配置文件所在目录解析，即项目根目录的 `state/`
+- `s3.endpoint`: set it to `https://ACCOUNT_ID.r2.cloudflarestorage.com`.
+- `s3.bucket`: use the bucket name from step 2.
+- `allowed_roots`: use the actual NAS directories that may be accessed.
+- `state_dir`: the default is `../state`, resolved relative to the configuration file, which places it at `state/` in the project root.
 
-以下 R2 参数应保持不变：
+Keep these R2 settings unchanged:
 
 ```json
 {
@@ -98,50 +98,50 @@ chmod 600 config/server.env
 }
 ```
 
-`presign_unsigned_payload` 让预签名 URL 包含 R2 官方示例使用的 `X-Amz-Content-Sha256=UNSIGNED-PAYLOAD`。不要复制阿里云示例中的 `x-amz-server-side-encryption` 请求头；R2 的 S3 兼容接口不支持该 SSE-S3 请求头，但所有 R2 对象及元数据本身都会自动使用 AES-256 静态加密。
+`presign_unsigned_payload` adds `X-Amz-Content-Sha256=UNSIGNED-PAYLOAD` to presigned URLs, as in R2's official examples. Do not copy the `x-amz-server-side-encryption` header from the Alibaba Cloud example. R2's S3-compatible API does not support that SSE-S3 header, but all R2 objects and metadata are automatically encrypted at rest with AES-256.
 
-编辑 [`config/server.env.example`](../config/server.env.example) 的副本 `config/server.env`，不要把实际秘密写进 JSON：
+Edit `config/server.env`, copied from [`config/server.env.example`](../config/server.env.example), instead of placing actual secrets in JSON:
 
 ```text
-NASS3CP_PASSWORD=替换为高强度随机密码
-CLOUDFLARE_R2_ACCESS_KEY_ID=替换为Access-Key-ID
-CLOUDFLARE_R2_SECRET_ACCESS_KEY=替换为Secret-Access-Key
+NASS3CP_PASSWORD=replace-with-a-strong-random-password
+CLOUDFLARE_R2_ACCESS_KEY_ID=replace-with-access-key-id
+CLOUDFLARE_R2_SECRET_ACCESS_KEY=replace-with-secret-access-key
 ```
 
-可以使用 Python 标准库生成密码：
+Generate a password with the Python standard library:
 
 ```bash
 python3 -c 'import secrets; print(secrets.token_urlsafe(32))'
 ```
 
-`bin/nass3cp-server` 会自动读取项目内的 `config/server.env`；未指定 `--config` 时使用 `config/server.json`。环境文件按 `KEY=VALUE` 解析，不作为 shell 脚本执行，不支持变量展开或命令替换；进程外部已经设置的环境变量优先。
+`bin/nass3cp-server` automatically reads the project's `config/server.env` and uses `config/server.json` when `--config` is omitted. Environment files are parsed as `KEY=VALUE` data, not executed as shell scripts. Variable expansion and command substitution are not supported. Existing process environment variables take precedence.
 
-也可以把密码直接写成 `"auth": {"password": "..."}`，但项目内的 `server.env` 更不容易被误提交。旧版的 `auth.token`/`NASS3CP_TOKEN` 仍然兼容。
+A literal `"auth": {"password": "..."}` also works, but using the local `server.env` reduces the risk of accidentally committing a password. Legacy `auth.token` / `NASS3CP_TOKEN` settings remain supported.
 
-## 6. 上线前验证
+## 6. Validate before deployment
 
-在项目根目录这样验证配置和 R2：
+From the project root, validate the configuration and R2 access:
 
 ```bash
 ./bin/nass3cp-server --check-config
 ./bin/nass3cp-server --check-s3
 ```
 
-`--check-s3` 只写入几十字节，读回校验后立即删除。
+`--check-s3` writes only a few dozen bytes, reads them back for verification, and immediately deletes the object.
 
-成功输出：
+Successful output:
 
 ```text
 S3 relay check passed (PUT, GET, DELETE)
 ```
 
-前台启动服务：
+Start the service in the foreground:
 
 ```bash
 ./bin/nass3cp-server
 ```
 
-需要退出 SSH 后继续运行时，可以使用 Linux 自带的 `nohup`，仍然不依赖 systemd：
+To keep it running after disconnecting SSH, use the Linux `nohup` command without systemd:
 
 ```bash
 mkdir -p run
@@ -149,20 +149,20 @@ nohup ./bin/nass3cp-server >run/nass3cp.log 2>&1 &
 echo $! >run/nass3cp.pid
 ```
 
-检查进程和日志：
+Inspect the process and logs:
 
 ```bash
 ps -p "$(cat run/nass3cp.pid)" -f
 tail -f run/nass3cp.log
 ```
 
-确认 `ps` 显示的是本项目的 `bin/nass3cp-server` 后，可以正常停止；服务会处理 `SIGTERM` 并关闭监听端口：
+After verifying that `ps` shows this project's `bin/nass3cp-server`, stop it gracefully. The service handles `SIGTERM` and closes the listening port:
 
 ```bash
 kill "$(cat run/nass3cp.pid)"
 ```
 
-客户端机器也可以直接保留一份项目目录，不需要安装。覆盖网络模式测试小文件时加 `--no-tls`，程序会在终端提示密码且输入不会回显：
+The client machine can also use a complete project directory without installation. Add `--no-tls` when testing a small file over an encrypted overlay network. The password prompt does not echo input:
 
 ```bash
 ./bin/nass3cp --no-tls --host 10.10.10.2 --port 9443 \
@@ -170,25 +170,25 @@ kill "$(cat run/nass3cp.pid)"
 NAS password:
 ```
 
-将 `10.10.10.2` 换成 NAS 的覆盖网络 IP。Windows 交互式客户端可在首次成功认证时加上 `--remember-password`，将密码保存到当前用户的 Windows 凭据管理器；以后相同端点和安全模式会自动读取。无人值守场景可使用 `--password-file`，或复制 `config/client.env.example` 为 `config/client.env` 并设置 `NASS3CP_PASSWORD`。
+Replace `10.10.10.2` with the NAS overlay IP. Interactive Windows clients can add `--remember-password` on the first successful authentication to save the password in Windows Credential Manager for the current user. Later connections to the same endpoint and security mode read it automatically. For unattended use, specify `--password-file`, or copy `config/client.env.example` to `config/client.env` and set `NASS3CP_PASSWORD`.
 
-Windows PowerShell 使用 `.cmd` 启动器，它会自动寻找 Python 3.8+：
+In Windows PowerShell, use the `.cmd` launcher, which locates Python 3.8+ automatically:
 
 ```powershell
 .\bin\nass3cp.cmd --no-tls --host 10.10.10.2 --port 9443 `
   nas:/volume1/share/small-test.bin .
 ```
 
-若 Python 不在 `PATH`，先设置 `$env:NASS3CP_PYTHON` 为 `python.exe` 的完整路径。
+If Python is not on `PATH`, first set `$env:NASS3CP_PYTHON` to the full path of `python.exe`.
 
-## 安全和费用说明
+## Security and cost notes
 
-- R2 数据通道始终使用 HTTPS；程序拒绝 HTTP Endpoint 和 HTTP 预签名 URL。
-- 无应用层 TLS 时，NAS 控制通道是 HTTP，密码也在这条通道内传输。只有在底层覆盖网络或隧道已经提供加密和身份认证时才可使用；内网地址本身不是安全边界。
-- 无 TLS 服务端允许监听 `0.0.0.0` 或 `::`，但这会在所有网卡上开放控制端口；应通过防火墙限制来源，或优先绑定覆盖网络 IP。
-- R2 自动进行 AES-256 静态加密，但 Cloudflare 在服务端解密时仍能看到文件明文。若要求云厂商不能读取内容，需要另加客户端侧 AEAD 加密。
-- 预签名 URL 是短时 Bearer 凭证，应像临时密码一样处理；默认 15 分钟过期。
-- 在上述免费额度内，偶尔传输 1 GiB 的 R2 费用通常为 $0。重试不会产生 R2 公网下行费，但仍会计入操作次数。
-- 中国大陆到 R2 的速度和稳定性取决于运营商及跨境链路，建议在 NAS 所在网络和常用客户端网络分别实测。
+- The R2 data channel always uses HTTPS. The program rejects HTTP endpoints and HTTP presigned URLs.
+- Without application-layer TLS, the NAS control channel uses HTTP, including password transmission. Use this mode only when the underlying overlay network or tunnel already provides encryption and authentication. A private address alone is not a security boundary.
+- A no-TLS server may listen on `0.0.0.0` or `::`, but doing so opens the control port on every interface. Restrict incoming connections with a firewall or preferably bind to the overlay IP.
+- R2 automatically uses AES-256 encryption at rest, but Cloudflare can still see plaintext when decrypting on the server. Add client-side AEAD encryption if the provider must not be able to read content.
+- Presigned URLs are short-lived Bearer credentials and should be treated like temporary passwords. They expire after 15 minutes by default.
+- Within the free tier described above, occasional 1 GiB transfers usually cost $0 in R2 charges. Retries incur no R2 internet egress fees but still count as operations.
+- Speed and reliability between mainland China and R2 depend on the ISP and cross-border links. Measure performance on both the NAS network and the networks commonly used by clients.
 
-官方参考：[创建 Bucket](https://developers.cloudflare.com/r2/buckets/create-buckets/)、[创建 R2 API Token](https://developers.cloudflare.com/r2/api/tokens/)、[预签名 URL](https://developers.cloudflare.com/r2/api/s3/presigned-urls/)、[生命周期规则](https://developers.cloudflare.com/r2/buckets/object-lifecycles/)、[数据安全](https://developers.cloudflare.com/r2/reference/data-security/)、[R2 定价](https://developers.cloudflare.com/r2/pricing/)。
+Official references: [create buckets](https://developers.cloudflare.com/r2/buckets/create-buckets/), [create R2 API tokens](https://developers.cloudflare.com/r2/api/tokens/), [presigned URLs](https://developers.cloudflare.com/r2/api/s3/presigned-urls/), [lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/), [data security](https://developers.cloudflare.com/r2/reference/data-security/), and [R2 pricing](https://developers.cloudflare.com/r2/pricing/).

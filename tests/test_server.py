@@ -834,6 +834,78 @@ class ServerTransferTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_browser_download_reuses_http_pipeline_and_serves_verified_unicode_file(self):
+        self.app.start_worker = lambda function, *args: threading.Thread(target=function, args=args, daemon=True).start()
+        content = "Chinese filename, verified file contents.\n".encode("utf-8")
+        filename = "报告 & #.txt"
+        (self.root / filename).write_bytes(content)
+        (self.root / "folder").mkdir()
+        nas = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, self.app)
+        nas_thread = threading.Thread(target=nas.serve_forever, daemon=True)
+        nas_thread.start()
+        api = ApiClient("http://127.0.0.1:%d" % nas.server_port, "password", timeout=5)
+        browser = BrowserServer(api, ".", port=0)
+        browser_thread = threading.Thread(target=browser.serve_forever, daemon=True)
+        browser_thread.start()
+        cookie = ""
+
+        def request(path, body=None):
+            connection = http.client.HTTPConnection("127.0.0.1", browser.server_port, timeout=5)
+            headers = {"Cookie": cookie}
+            if body is not None:
+                headers.update({"Content-Type": "application/json", "X-Nass3cp-Request": "download"})
+            try:
+                connection.request("GET" if body is None else "POST", path,
+                                   body=None if body is None else json.dumps(body), headers=headers)
+                response = connection.getresponse()
+                return response.status, dict(response.getheaders()), response.read()
+            finally:
+                connection.close()
+
+        def data_request(method, item, data=None, expected=None, attempts=4, progress=None, cancel_event=None):
+            client._check_download_cancelled(cancel_event)
+            transfer_id, index = item["url"].rsplit("/", 2)[-2:]
+            with self.fake.get_chunk(transfer_id, int(index)) as response:
+                value = response.read()
+            self.assertEqual(len(value), expected)
+            if progress is not None:
+                progress(len(value))
+            return value
+
+        try:
+            status, headers, _ = request("/?token=" + browser.launch_token)
+            self.assertEqual(status, 303)
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            with mock.patch("nass3cp.client._data_request", side_effect=data_request):
+                status, _, body = request("/api/downloads", {"paths": ["folder", filename]})
+                self.assertEqual(status, 202)
+                identifier = json.loads(body)["items"][1]["id"]
+                self.wait_until(lambda: browser.downloads.state()["items"][1]["status"] == "ready")
+                self.assertEqual(browser.downloads.state()["items"][0]["status"], "failed")
+                artifact = browser.downloads._items[identifier].artifact
+                self.assertEqual(artifact.suffix, ".nass3cp-part")
+                status, headers, body = request("/api/downloads/" + identifier + "/file")
+                self.assertEqual(status, 200)
+                self.assertEqual(body, content)
+                self.assertEqual(headers["Content-Length"], str(len(content)))
+                self.assertEqual(headers["Content-Type"], "application/octet-stream")
+                self.assertIn("attachment;", headers["Content-Disposition"])
+                self.assertIn("filename*=UTF-8''%E6%8A%A5%E5%91%8A%20%26%20%23.txt", headers["Content-Disposition"])
+                self.wait_until(lambda: not artifact.parent.exists())
+                state = json.loads(request("/api/downloads")[2])
+                self.assertEqual(state["items"][1]["status"], "complete")
+                self.assertEqual(state["items"][1]["sent"], len(content))
+                self.assertEqual(request("/api/downloads/" + identifier + "/file")[0], 409)
+            self.assertFalse(self.fake.objects)
+            self.assertLessEqual(self.fake.max_objects, 3)
+        finally:
+            browser.shutdown()
+            browser.server_close()
+            nas.shutdown()
+            nas.server_close()
+            browser_thread.join(timeout=5)
+            nas_thread.join(timeout=5)
+
     def test_http_resumable_single_file_round_trip(self):
         self.app.start_worker = lambda function, *args: threading.Thread(
             target=function,
