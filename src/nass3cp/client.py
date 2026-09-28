@@ -274,6 +274,7 @@ class ApiClient:
         ca_file: Optional[str] = None,
         insecure: bool = False,
         timeout: int = 30,
+        trusted_tunnel: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         parsed = urlsplit(self.base_url)
@@ -282,6 +283,7 @@ class ApiClient:
         if parsed.scheme == "http" and (ca_file is not None or insecure):
             raise ProtocolError("TLS options cannot be used with an HTTP NAS service")
         self.password = password
+        self.trusted_connection = (parsed.scheme == "https" and not insecure) or trusted_tunnel
         self.timeout = timeout
         if insecure:
             self.context = ssl._create_unverified_context()  # nosec - explicit CLI opt-in

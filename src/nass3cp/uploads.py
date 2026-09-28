@@ -26,11 +26,12 @@ class UploadError(Nass3cpError):
 
 
 class _Item:
-    def __init__(self, folder: str, name: str, size: int, mtime_ms: int):
+    def __init__(self, folder: str, name: str, size: int, mtime_ms: int, transport: str = "s3"):
         self.id = secrets.token_hex(16)
         self.folder, self.name = folder, name
         self.path = posixpath.join(folder, name)
         self.size, self.mtime_ms = size, mtime_ms
+        self.transport = transport
         self.status, self.phase = "waiting", "Waiting for local file"
         self.received = self.sent = 0
         self.error: Optional[str] = None
@@ -63,9 +64,11 @@ class _TrackedApi:
 
 class UploadManager:
     def __init__(self, api_factory: Callable[[], ApiClient], jobs: int = 2,
-                 inflight: int = 3, transfer_timeout: int = 86400):
+                 inflight: int = 3, transfer_timeout: int = 86400,
+                 direct_transfers: Any = None, transports: Any = ("s3",)):
         self.api_factory = api_factory
         self.jobs, self.inflight, self.transfer_timeout = jobs, inflight, transfer_timeout
+        self.direct_transfers, self.transports = direct_transfers, transports
         self._condition = threading.Condition(threading.RLock())
         self._items = OrderedDict()  # type: OrderedDict
         self._active: Optional[_Item] = None
@@ -81,11 +84,15 @@ class UploadManager:
                     "id": item.id, "path": item.path, "name": item.name, "size": item.size,
                     "mtime_ms": item.mtime_ms, "status": item.status, "phase": item.phase,
                     "received": item.received, "sent": item.sent, "error": item.error,
+                    "transport": item.transport,
                     "bytes_per_second": int(item.sent / elapsed) if elapsed > 0 else 0,
                 })
             return {"items": items, "concurrency": 1, "busy": self._active is not None}
 
     def enqueue(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        transport = body.get("transport", self.transports[0])
+        if transport not in self.transports or transport == "nathole" and self.direct_transfers is None:
+            raise UploadError(400, "The selected transfer method is not available.")
         folder, files = body.get("path"), body.get("files")
         if (not isinstance(folder, str) or not folder or "\x00" in folder
                 or len(folder.encode("utf-8", "surrogatepass")) > 8192):
@@ -112,7 +119,7 @@ class UploadManager:
             if name in names:
                 raise UploadError(400, "Select only one file with each name.")
             names.add(name)
-            candidates.append(_Item(folder, name, size, mtime))
+            candidates.append(_Item(folder, name, size, mtime, transport))
         with self._condition:
             if self._closed:
                 raise UploadError(503, "The local browser service is closing.")
@@ -122,7 +129,7 @@ class UploadManager:
                 existing = active.get(item.path)
                 if existing is not None:
                     if (existing.status != "waiting" or existing.size != item.size
-                            or existing.mtime_ms != item.mtime_ms):
+                            or existing.mtime_ms != item.mtime_ms or existing.transport != item.transport):
                         raise UploadError(409, "An upload to this path is already pending: " + item.path)
                     item = existing
                 selected.append(item)
@@ -247,16 +254,22 @@ class UploadManager:
                 with self._condition:
                     if item.status == "cancelling":
                         return
-                    if label == "upload to S3":
+                    if label in ("upload to S3", "upload via nathole"):
                         item.status, item.phase = "uploading", "Uploading to NAS"
                         item.sent = max(0, min(completed, item.size))
+                    elif label == "waiting for nathole":
+                        item.status, item.phase = "uploading", "Waiting for nathole"
                     else:
                         item.status, item.phase = "verifying", "Verifying and saving on NAS"
 
-            upload(api, str(Path(item.directory.name) / "payload.nass3cp-part"), item.path,
-                   False, self.jobs, self.transfer_timeout, True, self.inflight,
-                   destination_mtime_ns=item.mtime_ms * 1_000_000,
-                   progress_callback=progress, cancel_event=item.cancelled)
+            source = str(Path(item.directory.name) / "payload.nass3cp-part")
+            if item.transport == "nathole":
+                self.direct_transfers.upload(source, item.path, item.mtime_ms * 1_000_000,
+                                             progress, item.cancelled)
+            else:
+                upload(api, source, item.path, False, self.jobs, self.transfer_timeout, True, self.inflight,
+                       destination_mtime_ns=item.mtime_ms * 1_000_000,
+                       progress_callback=progress, cancel_event=item.cancelled)
             item.sent = item.size
         except Exception as exc:
             if item.cancelled.is_set():

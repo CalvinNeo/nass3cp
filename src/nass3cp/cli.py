@@ -375,6 +375,7 @@ def main(argv: Optional[List[str]] = None) -> None:
             password,
             ca_file=args.ca_file,
             insecure=args.insecure,
+            trusted_tunnel=args.no_tls,
         )
         if password_source == "saved" or args.remember_password:
             try:
@@ -392,6 +393,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                     password,
                     ca_file=args.ca_file,
                     insecure=args.insecure,
+                    trusted_tunnel=args.no_tls,
                 )
                 api.check_authenticated()
                 credential_store.save(password_target, password)

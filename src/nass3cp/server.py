@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -198,11 +199,13 @@ def _inside(path: Path, root: Path) -> bool:
 class ServerApp:
     def __init__(self, config: ServerConfig):
         self.config = config
-        self.s3 = S3Relay(config.s3)
+        self.s3 = S3Relay(config.s3) if config.s3 is not None else None
         self.store = TransferStore(config.state_dir)
         self._stop = threading.Event()
         self._pipeline_condition = threading.Condition()
         self.searches = SearchManager(config.search, self.resolve_remote_directory)
+        self.nathole: Any = None
+        self.direct_lock = threading.Lock()
 
     def validate(self) -> None:
         validate_server_config(self.config)
@@ -1593,6 +1596,8 @@ class ServerApp:
         )
 
     def cleanup_interrupted(self) -> None:
+        if self.s3 is None:
+            return
         for state in self.store.all():
             if state.get("status") not in ("complete", "error"):
                 continue
@@ -1606,6 +1611,8 @@ class ServerApp:
 
     def janitor(self) -> None:
         while not self._stop.wait(60):
+            if self.s3 is None:
+                continue
             cutoff = time.time() - self.config.transfer_ttl_seconds
             for state in self.store.all():
                 if float(state.get("updated_at", 0)) >= cutoff:
@@ -1699,8 +1706,21 @@ class RequestHandler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             if parsed.path == "/v1/health":
-                self._send_json(HTTPStatus.OK, {"status": "ok", "version": __version__})
+                value: Dict[str, Any] = {"status": "ok", "version": __version__,
+                                         "transports": ["s3"] if self.app.s3 is not None else []}
+                if self.app.nathole is not None:
+                    value["transports"].append("nathole")
+                    value["nathole"] = self.app.nathole.info()
+                self._send_json(HTTPStatus.OK, value)
                 return
+            if parsed.path == "/v1/files":
+                if self.app.nathole is None:
+                    raise ApiError(404, "not_found", "endpoint not found")
+                from .direct import serve_download
+                serve_download(self)
+                return
+            if parsed.path.startswith("/v1/transfers/") and self.app.s3 is None:
+                raise ApiError(503, "s3_disabled", "S3 transfers are not configured")
             match = re.fullmatch(r"/v1/searches/([0-9a-f]{32})", parsed.path)
             if match:
                 query = parse_qs(parsed.query, keep_blank_values=True)
@@ -1737,6 +1757,30 @@ class RequestHandler(BaseHTTPRequestHandler):
             return
         try:
             path = urlsplit(self.path).path
+            if path.startswith("/v1/nathole/"):
+                if self.app.nathole is None:
+                    raise ApiError(404, "not_found", "endpoint not found")
+                trusted = (isinstance(self.connection, ssl.SSLSocket)
+                           or ipaddress.ip_address(self.client_address[0]).is_loopback
+                           or self.app.config.nathole.trusted_http_registration)
+                if not trusted:
+                    raise ApiError(403, "trusted_channel_required", "device registration requires HTTPS or a configured trusted tunnel")
+                body = self._body()
+                try:
+                    if path == "/v1/nathole/peers":
+                        result = self.app.nathole.register(body)
+                    else:
+                        match = re.fullmatch(r"/v1/nathole/peers/([0-9a-f]{32})/remove", path)
+                        if not match:
+                            raise ApiError(404, "not_found", "endpoint not found")
+                        self.app.nathole.remove(match.group(1))
+                        result = {"removed": True}
+                except Nass3cpError as exc:
+                    raise ApiError(400, "registration_failed", str(exc)) from exc
+                self._send_json(200, result)
+                return
+            if path.startswith("/v1/transfers/") and self.app.s3 is None:
+                raise ApiError(503, "s3_disabled", "S3 transfers are not configured")
             body = self._body()
             if path == "/v1/searches":
                 self._send_json(202, self.app.searches.start(body))
@@ -1797,6 +1841,22 @@ class RequestHandler(BaseHTTPRequestHandler):
             LOG.exception("unhandled POST error")
             self._error(ApiError(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error"))
 
+    def do_PUT(self) -> None:
+        self.close_connection = True
+        if not self._authorize():
+            return
+        try:
+            if self.app.nathole is None or urlsplit(self.path).path != "/v1/files":
+                raise ApiError(404, "not_found", "endpoint not found")
+            from .direct import receive_upload
+            receive_upload(self)
+        except ApiError as exc:
+            self._error(exc)
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
+        except (OSError, ValueError):
+            self._error(ApiError(400, "upload_failed", "could not receive or save the file"))
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the nass3cp NAS-side service")
@@ -1821,6 +1881,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def check_s3(config: ServerConfig) -> None:
     """Verify the configured relay with a tiny, automatically removed object."""
+    if config.s3 is None:
+        raise ConfigError("S3 is not configured")
     relay = S3Relay(config.s3)
     transfer_id = secrets.token_hex(16)
     payload = b"nass3cp S3 relay check\n"
@@ -1848,6 +1910,14 @@ def validate_server_config(config: ServerConfig) -> Optional[ssl.SSLContext]:
     for root in config.allowed_roots:
         if not root.is_dir():
             raise ConfigError("allowed root is not a directory: %s" % root)
+    if config.nathole is not None:
+        from .nathole import validate_keys, validate_program
+        validate_program(config.nathole.program)
+        for private in (config.state_dir / "nathole", config.nathole.keys_dir):
+            if private is not None and any(_inside(private.resolve(), root.resolve()) for root in config.allowed_roots):
+                raise ConfigError("nathole credentials must be outside allowed_roots")
+        if config.nathole.keys_dir is not None:
+            validate_keys(config.nathole.keys_dir, True)
     if not config.tls_enabled:
         return None
     if config.cert_file is None or not config.cert_file.is_file():
@@ -1866,9 +1936,6 @@ def run(config: ServerConfig) -> None:
     server = Nass3cpHTTPServer((config.listen, config.port), RequestHandler, app)
     if context is not None:
         server.socket = context.wrap_socket(server.socket, server_side=True)
-    janitor = threading.Thread(target=app.janitor, daemon=True)
-    janitor.start()
-    app.start_worker(app.cleanup_interrupted)
     if context is None:
         LOG.warning(
             "listening without application TLS on %s:%d; the overlay/tunnel must be encrypted",
@@ -1885,10 +1952,32 @@ def run(config: ServerConfig) -> None:
             raise KeyboardInterrupt
 
         signal.signal(signal.SIGTERM, handle_sigterm)
+    tunnel_http = None
+    tunnel_thread = None
     try:
+        if config.nathole is not None:
+            from .nathole import ServerTunnels
+            # Preserve the existing listener and TLS configuration. The authenticated
+            # outer tunnel forwards to a separate, strictly loopback HTTP endpoint.
+            tunnel_http = Nass3cpHTTPServer(("127.0.0.1", 0), RequestHandler, app)
+            tunnel_thread = threading.Thread(target=tunnel_http.serve_forever, daemon=True)
+            tunnel_thread.start()
+            app.nathole = ServerTunnels(config.nathole, config.state_dir,
+                                         "127.0.0.1:%d" % tunnel_http.server_port)
+            app.nathole.start()
+        janitor = threading.Thread(target=app.janitor, daemon=True)
+        janitor.start()
+        app.start_worker(app.cleanup_interrupted)
         server.serve_forever(poll_interval=0.5)
     finally:
         app.stop()
+        if app.nathole is not None:
+            app.nathole.close()
+        if tunnel_http is not None:
+            tunnel_http.shutdown()
+            tunnel_http.server_close()
+            if tunnel_thread:
+                tunnel_thread.join(timeout=5)
         server.server_close()
         if previous_sigterm is not None:
             signal.signal(signal.SIGTERM, previous_sigterm)

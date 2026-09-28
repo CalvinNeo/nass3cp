@@ -12,6 +12,8 @@ NAS    ──HTTPS──► R2/S3 ──HTTPS──► Client  # Download from N
 
 The copy commands support individual regular files and recursive merges between local and NAS directories. Non-recursive NAS directory listing is also available. Single-file uploads and downloads can use `--mode parallel` for concurrent transfers and resumption with 64 MiB chunks. The runtime requires only Python 3.8+ and its standard library, with no third-party Python dependencies.
 
+The browser also supports optional [nathole transfers](docs/nathole.md). Explicitly enable `nathole.enabled: true` in the NAS JSON configuration to start its managed background service. Without that setting, no nathole process or credential setup runs and the submodule is not required. Choose **S3** or **nathole** in the webpage for each upload/download batch; no transport CLI option is needed. nathole forwards nass3cp's whole-file API with concurrency fixed at one, SHA-256 verification and cancellation, without pipeline/parallel semantics or resumption. New devices enroll through the existing trusted, authenticated NAS control channel; existing `tunnel-keys` pairs can also be imported.
+
 ## Security model
 
 - The NAS API uses password authentication. By default, the client prompts securely in the terminal, so the password does not need to be saved in client configuration or shell history.

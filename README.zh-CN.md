@@ -12,6 +12,8 @@ NAS  ──HTTPS──► R2/S3 ──HTTPS──► 本机    # 从 NAS 下载
 
 复制功能支持单个普通文件，也支持在本机目录和 NAS 目录之间递归合并复制；另提供非递归的 NAS 目录列表功能。单文件上传和下载可用 `--mode parallel` 按 64 MiB 分块并发和断点续传。运行时仅需 Python 3.8+ 标准库，没有第三方 Python 依赖。
 
+网页还支持可选的 [nathole 传输](docs/nathole.md)。只有在 NAS JSON 配置中显式设置 `nathole.enabled: true`，才会启动受管理的后台服务；未启用时不启动 nathole 进程、不初始化凭据，也不要求安装 submodule。在网页上传表单或下载按钮旁选择 **S3** / **nathole**，选择固定到该批文件，无须传输模式命令行参数。nathole 转发 nass3cp 提供的完整文件接口，并发固定为 1，支持 SHA-256 校验和取消，不使用 pipeline、parallel 或断点续传语义。新设备通过现有可信且经过认证的 NAS 控制信道注册，也可以导入既有 `tunnel-keys` 配对凭据。
+
 ## 安全模型
 
 - NAS API 使用密码认证。客户端默认在终端安全提示输入密码，不需要把密码保存在客户端配置或命令行历史中。

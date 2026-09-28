@@ -1,4 +1,5 @@
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -163,6 +164,54 @@ def _load_search(raw: Any) -> SearchConfig:
 
 
 @dataclass(frozen=True)
+class NatholeConfig:
+    server: str
+    program: Path
+    keys_dir: Optional[Path] = None
+    room: str = "nass3cp"
+    trusted_http_registration: bool = False
+
+
+def _load_nathole(raw: Any, base: Path) -> Optional[NatholeConfig]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("nathole must be an object")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("nathole.enabled must be a boolean")
+    if not enabled:
+        return None
+    raw = _expand_env(raw)
+    coordinator = _require(raw, "coordinator", dict)
+    try:
+        host = str(ipaddress.IPv4Address(_require(coordinator, "host", str)))
+    except ValueError as exc:
+        raise ConfigError("nathole.coordinator.host must be an IPv4 address") from exc
+    port = _positive_int(coordinator, "port", 40000)
+    if port > 65533:
+        raise ConfigError("nathole.coordinator.port must be at most 65533 (UDP uses port + 1 and + 2)")
+    program_value = raw.get("program")
+    if program_value is None:
+        program = Path(__file__).resolve().parents[2] / "third_party" / "nathole" / "nat4_tunnel.py"
+    elif isinstance(program_value, str) and program_value:
+        program = _path_from_config(program_value, base)
+    else:
+        raise ConfigError("nathole.program must be a path to nat4_tunnel.py")
+    keys = raw.get("keys_dir")
+    if keys is not None and (not isinstance(keys, str) or not keys):
+        raise ConfigError("nathole.keys_dir must be a path")
+    room = raw.get("room", "nass3cp")
+    if not isinstance(room, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", room):
+        raise ConfigError("nathole.room must be a label of 1 to 64 letters, digits, underscores or hyphens")
+    trusted = raw.get("trusted_http_registration", False)
+    if not isinstance(trusted, bool):
+        raise ConfigError("nathole.trusted_http_registration must be a boolean")
+    return NatholeConfig("%s:%d" % (host, port), program,
+                         _path_from_config(keys, base) if keys else None, room, trusted)
+
+
+@dataclass(frozen=True)
 class ServerConfig:
     listen: str
     port: int
@@ -175,8 +224,9 @@ class ServerConfig:
     chunk_size: int
     transfer_ttl_seconds: int
     max_file_size: int
-    s3: S3Config
+    s3: Optional[S3Config]
     search: SearchConfig = field(default_factory=SearchConfig)
+    nathole: Optional[NatholeConfig] = None
 
 
 def _load_s3(raw: Mapping[str, Any]) -> S3Config:
@@ -271,13 +321,16 @@ def load_server_config(filename: str) -> ServerConfig:
     config_path = Path(filename).expanduser().resolve()
     try:
         with config_path.open("r", encoding="utf-8") as handle:
-            raw = _expand_env(json.load(handle))
+            raw = json.load(handle)
     except (OSError, ValueError) as exc:
         raise ConfigError("cannot read configuration: %s" % exc) from exc
     if not isinstance(raw, dict):
         raise ConfigError("configuration root must be a JSON object")
 
     base = config_path.parent
+    nathole = _load_nathole(raw.get("nathole"), base)
+    # An inactive optional integration must not demand its secrets or paths.
+    raw = _expand_env({key: value for key, value in raw.items() if key != "nathole"})
     tls = _require(raw, "tls", dict)
     auth = _require(raw, "auth", dict)
     roots_raw = _require(raw, "allowed_roots", list)
@@ -345,6 +398,8 @@ def load_server_config(filename: str) -> ServerConfig:
         chunk_size=chunk_size,
         transfer_ttl_seconds=_positive_int(raw, "transfer_ttl_seconds", 24 * 3600),
         max_file_size=_positive_int(raw, "max_file_size", 1024 * 1024 * 1024 * 1024),
-        s3=_load_s3(_require(raw, "s3", dict)),
+        s3=(_load_s3(_require(raw, "s3", dict))
+            if raw.get("s3") is not None or nathole is None else None),
         search=_load_search(raw.get("search", {})),
+        nathole=nathole,
     )

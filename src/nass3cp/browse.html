@@ -80,6 +80,7 @@
                 </label>
                 <span id="upload-selection" class="note" role="status">No local files selected</span>
                 <p class="note">Existing files are kept.</p>
+                $upload_transport
                 <div class="popover-actions"><button id="upload-start" type="submit" disabled>Upload files</button></div>
               </form>
             </div>
@@ -123,6 +124,7 @@
         <div id="selection-bar" class="selection-bar" hidden>
           <span id="selection-count" role="status">0 files selected</span>
           <span class="selection-note">Across folders and pages</span>
+          $download_transport
           <button id="download-selected" type="button" disabled>Download selected</button>
           <button id="selection-clear" class="secondary" type="button" disabled>Clear selection</button>
         </div>

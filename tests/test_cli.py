@@ -383,6 +383,7 @@ class CliTests(unittest.TestCase):
             "saved-password",
             ca_file=None,
             insecure=False,
+            trusted_tunnel=False,
         )
         api.check_authenticated.assert_called_once_with()
         prompt.assert_not_called()

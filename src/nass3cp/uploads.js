@@ -102,7 +102,7 @@
       }
       retry.disabled = true;
       try {
-        await queue([file], item.path.slice(0, item.path.lastIndexOf("/")) || "/");
+        await queue([file], item.path.slice(0, item.path.lastIndexOf("/")) || "/", item.transport);
         localFiles.delete(item.id);
       } catch (problem) { showError(problem.message); }
       finally { retry.disabled = false; }
@@ -128,7 +128,7 @@
       if (!view) { view = createRow(item); views.set(item.id, view); }
       view.name.textContent = item.name;
       view.path.textContent = item.path;
-      view.phase.textContent = item.phase;
+      view.phase.textContent = item.phase + (item.transport === "nathole" ? " · nathole" : "");
       view.problem.textContent = item.error || (item.status === "waiting" && !localFiles.has(item.id) ?
         "Choose this local file again to upload it." : "");
       view.problem.hidden = !view.problem.textContent;
@@ -151,8 +151,10 @@
     }
     pump();
   }
-  async function queue(files, destination) {
-    const data = await request("/api/uploads", {path: destination, files: files.map(file => ({
+  async function queue(files, destination, selectedTransport) {
+    const choice = document.getElementById("upload-transport");
+    const transport = selectedTransport || (choice ? choice.value : "s3");
+    const data = await request("/api/uploads", {path: destination, transport, files: files.map(file => ({
       name: file.name, size: file.size, mtime_ms: Math.max(0, file.lastModified),
     }))});
     if (!Array.isArray(data.enqueued_ids) || data.enqueued_ids.length !== files.length) {

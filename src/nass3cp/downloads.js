@@ -139,7 +139,7 @@
     retry.setAttribute("aria-label", "Retry download of " + item.name);
     retry.addEventListener("click", async () => {
       retry.disabled = true;
-      try { await mutate("/api/downloads", {paths: [item.path]}); }
+      try { await mutate("/api/downloads", {paths: [item.path], transport: item.transport || "s3"}); }
       catch (problem) { showError(problem.message); }
       finally { retry.disabled = false; }
     });
@@ -152,7 +152,11 @@
     panel.dataset.pending = live.length;
     panel.dataset.attention = data.items.some(item => item.status === "failed" || item.status === "expired");
     document.dispatchEvent(new Event("nass3cp:transfers-changed"));
-    summary.textContent = live.length + " pending · " + queued + " queued · File concurrency: " + data.concurrency;
+    const direct = data.items.some(item => item.transport === "nathole");
+    const s3 = data.items.some(item => item.transport !== "nathole");
+    summary.textContent = live.length + " pending · " + queued + " queued · " +
+      (direct ? "nathole: one file at a time" + (s3 ? " · S3 concurrency: " + data.concurrency : "") :
+        "File concurrency: " + data.concurrency);
     const ids = new Set(data.items.map(item => item.id));
     for (const [id, view] of rowViews) {
       if (!ids.has(id)) { view.row.remove(); rowViews.delete(id); }
@@ -165,7 +169,7 @@
       if (!view) { view = createRow(item); rowViews.set(item.id, view); }
       view.name.textContent = item.name;
       view.path.textContent = item.path;
-      view.phase.textContent = item.phase;
+      view.phase.textContent = item.phase + (item.transport === "nathole" ? " · nathole" : "");
       view.problem.textContent = item.error || "";
       view.problem.hidden = !item.error;
       const delivered = item.status === "sending" || item.status === "complete";
@@ -229,7 +233,8 @@
     const paths = [...selected];
     refreshSelection();
     try {
-      await mutate("/api/downloads", {paths});
+      const transport = document.getElementById("download-transport");
+      await mutate("/api/downloads", {paths, transport: transport ? transport.value : "s3"});
       for (const path of paths) selected.delete(path);
       document.dispatchEvent(new Event("nass3cp:show-transfers"));
       panel.scrollIntoView({block: "nearest", behavior: "smooth"});

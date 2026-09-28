@@ -43,9 +43,10 @@ def safe_filename(path: str) -> str:
 
 
 class _Item:
-    def __init__(self, path: str):
+    def __init__(self, path: str, transport: str = "s3"):
         self.id = secrets.token_hex(16)
         self.path, self.name = path, safe_filename(path)
+        self.transport = transport
         self.status, self.phase = "queued", "Queued"
         self.total: Optional[int] = None
         self.received = self.sent = 0
@@ -86,12 +87,14 @@ class _TrackedApi:
 class DownloadManager:
     def __init__(self, api_factory: Callable[[], ApiClient], concurrency: int = 1,
                  jobs: int = 2, inflight: int = 3, transfer_timeout: int = 86400,
-                 ready_timeout: float = 600):
+                 ready_timeout: float = 600, direct_transfers: Any = None,
+                 transports: Any = ("s3",)):
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) or not 1 <= concurrency <= 8:
             raise ValueError("download concurrency must be between 1 and 8")
         self.api_factory, self.concurrency = api_factory, concurrency
         self.jobs, self.inflight, self.transfer_timeout = jobs, inflight, transfer_timeout
         self.ready_timeout = ready_timeout
+        self.direct_transfers, self.transports = direct_transfers, transports
         self._condition = threading.Condition(threading.RLock())
         self._items = OrderedDict()  # type: OrderedDict
         self._queue = deque()  # type: deque
@@ -104,6 +107,7 @@ class DownloadManager:
             "id": item.id, "path": item.path, "name": item.name, "status": item.status,
             "phase": item.phase, "size": item.total, "received": item.received,
             "sent": item.sent, "error": item.error,
+            "transport": item.transport,
             "bytes_per_second": int(item.received / elapsed) if elapsed > 0 else 0,
         }
 
@@ -113,6 +117,9 @@ class DownloadManager:
                     "items": [self._snapshot(item) for item in self._items.values()]}
 
     def enqueue(self, body: Mapping[str, Any]) -> Dict[str, Any]:
+        transport = body.get("transport", self.transports[0])
+        if transport not in self.transports or transport == "nathole" and self.direct_transfers is None:
+            raise DownloadError(400, "The selected transfer method is not available.")
         paths = body.get("paths")
         if not isinstance(paths, list) or not 1 <= len(paths) <= MAX_FILES:
             raise DownloadError(400, "Select between 1 and %d files." % MAX_FILES)
@@ -133,7 +140,7 @@ class DownloadManager:
                 raise DownloadError(409, "The download queue is full. Wait for files to finish.")
             enqueued = []
             for path in paths:
-                item = _Item(path)
+                item = _Item(path, transport)
                 self._items[item.id] = item
                 self._queue.append(item)
                 enqueued.append(item.id)
@@ -183,18 +190,24 @@ class DownloadManager:
                     with self._condition:
                         if item.status == "cancelling":
                             return
-                        item.total = total
+                        if label != "waiting for nathole":
+                            item.total = total
                         if label == "verify download":
                             item.status, item.phase = "verifying", "Verifying SHA-256"
-                        elif label in ("download from S3", "copy from NAS via S3"):
+                        elif label in ("download from S3", "copy from NAS via S3", "download via nathole"):
                             item.status, item.phase = "downloading", "Downloading"
                             item.received = max(0, min(completed, total))
+                        elif label == "waiting for nathole":
+                            item.status, item.phase = "preparing", "Waiting for nathole"
                         else:
                             item.status, item.phase = "preparing", "Preparing on NAS"
 
                 try:
-                    download(api, item.path, str(target), False, self.jobs, self.transfer_timeout,
-                             True, self.inflight, progress_callback=progress, cancel_event=item.cancelled)
+                    if item.transport == "nathole":
+                        self.direct_transfers.download(item.path, str(target), progress, item.cancelled)
+                    else:
+                        download(api, item.path, str(target), False, self.jobs, self.transfer_timeout,
+                                 True, self.inflight, progress_callback=progress, cancel_event=item.cancelled)
                 finally:
                     if item.transfer_id is not None:
                         if item.cancelled.is_set() or not target.exists():

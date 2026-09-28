@@ -1,0 +1,21 @@
+{
+  "listen": "127.0.0.1",
+  "port": 9443,
+  "tls": {
+    "enabled": false
+  },
+  "auth": {
+    "password": "${NASS3CP_PASSWORD}"
+  },
+  "allowed_roots": [
+    "/volume1/share"
+  ],
+  "state_dir": "../state",
+  "nathole": {
+    "enabled": true,
+    "coordinator": {
+      "host": "203.0.113.10",
+      "port": 40000
+    }
+  }
+}

@@ -165,6 +165,8 @@ def _render(
         summary=_escape(summary) if error is None else "Could not load folder",
         pagination=pagination,
         upload_disabled="disabled" if error is not None else "",
+        download_transport=server.transport_selector("download"),
+        upload_transport=server.transport_selector("upload"),
     ).encode("utf-8")
 
 
@@ -174,7 +176,7 @@ class BrowserServer(ThreadingHTTPServer):
 
     def __init__(self, api: ApiClient, initial_path: str, port: int = 8765,
                  download_concurrency: int = 1, jobs: int = 2, inflight: int = 3,
-                 transfer_timeout: int = 86400):
+                 transfer_timeout: int = 86400, capabilities: Any = None):
         self.api = api
         self.initial_path = initial_path
         self.launch_token = secrets.token_urlsafe(32)
@@ -185,8 +187,22 @@ class BrowserServer(ThreadingHTTPServer):
         self.search_script = resources.read_binary("nass3cp", "browse.js")
         self.download_script = resources.read_binary("nass3cp", "downloads.js")
         self.upload_script = resources.read_binary("nass3cp", "uploads.js")
-        self.downloads = DownloadManager(api.clone, download_concurrency, jobs, inflight, transfer_timeout)
-        self.uploads = UploadManager(api.clone, jobs, inflight, transfer_timeout)
+        capabilities = capabilities if isinstance(capabilities, dict) else {}
+        offered = capabilities.get("transports", ["s3"])
+        if not isinstance(offered, list) or not all(isinstance(item, str) for item in offered):
+            raise Nass3cpError("The NAS returned invalid transfer capabilities.")
+        self.transports = tuple(item for item in ("s3", "nathole") if item in offered)
+        if not self.transports:
+            self.transports = ("s3",)
+        self.direct_transfers: Any = None
+        if "nathole" in self.transports:
+            from .direct import DirectTransfers
+            from .nathole import ClientTunnel
+            self.direct_transfers = DirectTransfers(ClientTunnel(api, capabilities.get("nathole", {})))
+        self.downloads = DownloadManager(api.clone, download_concurrency, jobs, inflight, transfer_timeout,
+                                         direct_transfers=self.direct_transfers, transports=self.transports)
+        self.uploads = UploadManager(api.clone, jobs, inflight, transfer_timeout,
+                                     direct_transfers=self.direct_transfers, transports=self.transports)
         self.search_ids = set()  # type: set
         self.active_search_ids = set()  # type: set
         super().__init__(("127.0.0.1", port), BrowserHandler)
@@ -195,6 +211,14 @@ class BrowserServer(ThreadingHTTPServer):
     @property
     def url(self) -> str:
         return "http://localhost:%d/?token=%s" % (self.server_port, self.launch_token)
+
+    def transport_selector(self, action: str) -> str:
+        if self.transports == ("s3",):
+            return ""
+        options = "".join('<option value="%s">%s</option>' % (value, "S3" if value == "s3" else "nathole")
+                          for value in self.transports)
+        return '<label class="transport-choice" for="%s-transport">Via <select id="%s-transport">%s</select></label>' % (
+            action, action, options)
 
     def server_close(self) -> None:
         try:
@@ -209,6 +233,8 @@ class BrowserServer(ThreadingHTTPServer):
                 self.search_ids.clear()
                 self.active_search_ids.clear()
         finally:
+            if self.direct_transfers is not None:
+                self.direct_transfers.close()
             super().server_close()
 
 
@@ -521,7 +547,8 @@ def run_browser(api: ApiClient, path: str, port: int = 8765, open_browser: bool 
                 transfer_timeout: int = 86400) -> None:
     # Authenticate and validate the starting directory before listening locally.
     list_remote_page(api, path, page_size=PAGE_SIZE)
-    with BrowserServer(api, path, port, download_concurrency, jobs, inflight, transfer_timeout) as server:
+    capabilities = api.request("GET", "/v1/health")
+    with BrowserServer(api, path, port, download_concurrency, jobs, inflight, transfer_timeout, capabilities) as server:
         print("NAS file browser: %s" % server.url, flush=True)
         print("Press Ctrl+C to stop.", flush=True)
         if open_browser:
